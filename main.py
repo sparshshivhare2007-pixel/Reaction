@@ -468,7 +468,17 @@ async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return REPORT_URLS
 
-    flow_state(context)["targets"] = links
+    flow = flow_state(context)
+    sessions = flow.get("sessions", [])
+    api_id = flow.get("api_id") or config.API_ID
+    api_hash = flow.get("api_hash") or config.API_HASH
+
+    valid, error_text = await validate_targets(links, sessions, api_id, api_hash)
+    if not valid:
+        await update.effective_message.reply_text(friendly_error(error_text or "Unable to validate the provided links."))
+        return REPORT_URLS
+
+    flow["targets"] = links
     await update.effective_message.reply_text("Select the report type.", reply_markup=reason_keyboard())
     return REPORT_REASON_TYPE
 
@@ -618,6 +628,49 @@ async def resolve_chat_id(client: Client, target: str):
     identifier = extract_target_identifier(target)
     chat = await client.get_chat(identifier)
     return chat.id
+
+
+async def validate_targets(targets: list[str], sessions: list[str], api_id: int | None, api_hash: str | None) -> tuple[bool, str | None]:
+    """Confirm each target link or username resolves before starting reports."""
+
+    if not targets:
+        return False, "No targets provided for validation."
+
+    if not sessions:
+        return False, "No sessions available to validate the provided targets."
+
+    if not (api_id and api_hash):
+        ensure_pyrogram_creds()
+        api_id = config.API_ID
+        api_hash = config.API_HASH
+
+    client = Client(
+        name="target_validator",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=sessions[0],
+        workdir="/tmp/target_validator",
+    )
+
+    try:
+        await client.start()
+
+        for target in targets:
+            try:
+                await resolve_chat_id(client, target)
+            except UsernameNotOccupied:
+                return False, f"The username or link '{target}' is not occupied. Please check it."
+            except BadRequest as exc:
+                return False, f"The link '{target}' is not valid: {exc}."
+            except RPCError as exc:
+                return False, f"Could not resolve '{target}' ({exc})."
+
+        return True, None
+    finally:
+        try:
+            await client.stop()
+        except Exception:
+            pass
 
 
 async def perform_reporting(
