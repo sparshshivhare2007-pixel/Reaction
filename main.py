@@ -817,10 +817,16 @@ async def resolve_chat_id(client: Client, target: str, invite_link: str | None =
         return chat.id
 
     if details["type"] == "private_message":
-        if invite_link:
-            await client.join_chat(invite_link)
         chat_id = details["chat_id"]
-        await client.get_chat(chat_id)
+
+        if invite_link:
+            # Prefer the chat ID returned from the join to avoid malformed or stale IDs
+            chat = await client.join_chat(invite_link)
+            chat_id = getattr(chat, "id", chat_id)
+        else:
+            chat = await client.get_chat(chat_id)
+            chat_id = getattr(chat, "id", chat_id)
+
         await client.get_messages(chat_id, details["message_id"])
         return chat_id
 
