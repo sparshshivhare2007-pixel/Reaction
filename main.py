@@ -974,6 +974,21 @@ async def perform_reporting(
                 "error": last_error or "Unable to resolve the target with the available sessions.",
             }
 
+        # Ensure every client can access the target when an invite link is supplied.
+        if invite_link:
+            for client in clients:
+                try:
+                    await client.join_chat(invite_link)
+                except FloodWait as fw:
+                    await asyncio.sleep(getattr(fw, "value", 1))
+                    try:
+                        await client.join_chat(invite_link)
+                    except Exception:
+                        pass
+                except Exception:
+                    # Keep going; other sessions may still be able to join/report.
+                    pass
+
         success = 0
         failed = 0
 
