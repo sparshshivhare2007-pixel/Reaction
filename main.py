@@ -625,9 +625,23 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
 
 
 async def resolve_chat_id(client: Client, target: str):
-    identifier = extract_target_identifier(target)
-    chat = await client.get_chat(identifier)
-    return chat.id
+    """Resolve a Telegram username or link to a numeric chat ID.
+
+    The function accepts usernames with or without a leading ``@`` and uses
+    ``Client.get_users`` to avoid deprecated resolution methods. Clear error
+    messages are propagated for callers to present to end users.
+    """
+
+    identifier = extract_target_identifier(target).lstrip("@")
+
+    try:
+        user = await client.get_users(identifier)
+    except UsernameNotOccupied as exc:
+        raise UsernameNotOccupied(f"Username '{identifier}' is not occupied") from exc
+    except (BadRequest, RPCError) as exc:
+        raise exc
+
+    return user.id if not isinstance(user, list) else user[0].id
 
 
 async def validate_targets(targets: list[str], sessions: list[str], api_id: int | None, api_hash: str | None) -> tuple[bool, str | None]:
