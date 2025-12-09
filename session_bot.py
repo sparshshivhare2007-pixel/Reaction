@@ -34,25 +34,27 @@ user_states: Dict[int, UserState] = {}
 
 
 def parse_telegram_url(url: str) -> dict:
+    """Parse a Telegram URL into structured components.
+
+    The structure mirrors the parser in ``main.py`` so both bots agree on
+    which keys are present for each link type. This prevents runtime
+    mismatches when handling user-provided links.
+    """
+
     cleaned = url.strip()
     if not cleaned:
         raise ValueError("Empty URL")
 
-    if not cleaned.startswith("http"):
-        cleaned = f"https://{cleaned}"
-
-    parsed = urlparse(cleaned)
+    parsed = urlparse(cleaned if cleaned.startswith("http") else f"https://{cleaned}")
     path_parts = [p for p in parsed.path.split("/") if p]
 
     if not parsed.netloc.endswith("t.me") or not path_parts:
         raise ValueError("Invalid Telegram URL")
 
-    first = path_parts[0]
+    if path_parts[0].startswith("+"):
+        return {"type": "invite", "invite_link": f"https://t.me/{path_parts[0]}"}
 
-    if first.startswith("+"):
-        return {"type": "invite_link", "invite": first}
-
-    if first == "c" and len(path_parts) >= 3:
+    if path_parts[0] == "c" and len(path_parts) >= 3:
         return {
             "type": "private_message",
             "chat_id": int(f"-100{path_parts[1]}"),
@@ -72,6 +74,9 @@ def parse_telegram_url(url: str) -> dict:
             "username": path_parts[0],
             "message_id": int(path_parts[1]),
         }
+
+    if len(path_parts) == 1:
+        return {"type": "username", "username": path_parts[0]}
 
     raise ValueError("Unrecognized Telegram URL format")
 
@@ -131,10 +136,10 @@ async def handle_private_flow(client: Client, message: Message, state: UserState
         return
 
     if state.stage == "waiting_invite":
-        if parsed.get("type") != "invite_link":
+        if parsed.get("type") != "invite":
             await message.reply_text("Please send a valid private invite link (https://t.me/+code)")
             return
-        state.invite_link = f"https://t.me/{parsed['invite']}"
+        state.invite_link = parsed.get("invite_link")
         state.stage = "waiting_private_message"
         await message.reply_text("Now send the private message link (https://t.me/c/123456789/45)")
         return
