@@ -89,6 +89,17 @@ python main.py
 - `/help` – show usage instructions.
 - `/cancel` – abort the current flow.
 
+## Dark-themed chat mockup
+Use the following layout as a quick reference for presenting the bot inside a dark-themed mobile chat UI (Telegram-style):
+
+- **Chat header:** Standard bot header at the top.
+- **User input:** A bubble with the text `/start` to kick things off.
+- **Bot reply box:** A large, clearly bordered card beneath the user bubble with:
+  - **Title:** An emoji-led heading such as `👋 Welcome! Bot Instructions`.
+  - **Content:** A bullet list outlining reporting, session management, and API ID/Hash usage in a technical, well-spaced format.
+  - **Call to action:** Finish with `Use /report to begin or the panel below.`
+- **Buttons:** Stack three prominent rounded buttons under the reply box: `Start_Report_`, `Add_Sessions_`, and `View_Saved_`.
+
 ## Notes
 - Minimum reports per link: 500; maximum: 7000; default: 5000.
 - Minimum sessions: 1; maximum: 500. Invalid sessions are skipped automatically.

@@ -29,7 +29,17 @@ from report import report_profile_photo
 from storage import DataStore
 
 # Conversation states
-API_ID_STATE, API_HASH_STATE, REPORT_SESSIONS, TARGET_KIND, REPORT_URLS, REPORT_REASON_TYPE, REPORT_MESSAGE, REPORT_COUNT = range(8)
+(
+    API_ID_STATE,
+    API_HASH_STATE,
+    REPORT_SESSIONS,
+    TARGET_KIND,
+    REPORT_URLS,
+    REPORT_REASON_TYPE,
+    REPORT_MESSAGE,
+    REPORT_COUNT,
+    SESSION_MODE,
+) = range(9)
 ADD_SESSIONS = 10
 
 DEFAULT_REPORTS = 5000
@@ -82,6 +92,15 @@ def reason_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Spam", callback_data="reason:0"), InlineKeyboardButton("Violence", callback_data="reason:1")],
             [InlineKeyboardButton("Pornography", callback_data="reason:2"), InlineKeyboardButton("Child abuse", callback_data="reason:3")],
             [InlineKeyboardButton("Copyright", callback_data="reason:4"), InlineKeyboardButton("Other", callback_data="reason:5")],
+        ]
+    )
+
+
+def session_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Report with saved sessions", callback_data="session_mode:reuse")],
+            [InlineKeyboardButton("Add new sessions", callback_data="session_mode:new")],
         ]
     )
 
@@ -199,8 +218,67 @@ async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    saved_sessions = context.user_data.get("saved_sessions", [])
+
+    if query.data == "session_mode:reuse":
+        if not saved_sessions:
+            await query.edit_message_text(
+                friendly_error("No saved sessions available. Please add new sessions to continue."),
+                reply_markup=main_menu_keyboard(),
+            )
+            return ConversationHandler.END
+
+        context.user_data["sessions"] = list(saved_sessions)
+        await query.edit_message_text(
+            "Using your saved sessions. What are you reporting?",
+            reply_markup=target_kind_keyboard(),
+        )
+        return TARGET_KIND
+
+    await query.edit_message_text(
+        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line)."
+    )
+    return REPORT_SESSIONS
+
+
 async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    saved_api_id = context.user_data.get("saved_api_id")
+    saved_api_hash = context.user_data.get("saved_api_hash")
+    saved_sessions = context.user_data.get("saved_sessions", [])
+
+    # Reset conversation-specific values while keeping any previously stored credentials/sessions
     context.user_data.clear()
+    if saved_api_id and saved_api_hash:
+        context.user_data["saved_api_id"] = saved_api_id
+        context.user_data["saved_api_hash"] = saved_api_hash
+    if saved_sessions:
+        context.user_data["saved_sessions"] = saved_sessions
+
+    if saved_api_id and saved_api_hash:
+        context.user_data["api_id"] = saved_api_id
+        context.user_data["api_hash"] = saved_api_hash
+        if saved_sessions:
+            await update.effective_message.reply_text(
+                (
+                    f"Using your saved API credentials. {len(saved_sessions)} active session(s) ready.\n"
+                    "Do you want to reuse them or add new sessions?"
+                ),
+                reply_markup=session_mode_keyboard(),
+            )
+            return SESSION_MODE
+
+        await update.effective_message.reply_text(
+            (
+                "Using your saved API credentials. Send between "
+                f"{MIN_SESSIONS}-{MAX_SESSIONS} Pyrogram session strings (one per line)."
+            )
+        )
+        return REPORT_SESSIONS
+
     await update.effective_message.reply_text("Enter your Telegram API ID (numeric).")
     return API_ID_STATE
 
@@ -212,6 +290,7 @@ async def handle_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return API_ID_STATE
 
     context.user_data["api_id"] = int(text)
+    context.user_data["saved_api_id"] = int(text)
     await update.effective_message.reply_text("Enter your API Hash.")
     return API_HASH_STATE
 
@@ -223,6 +302,7 @@ async def handle_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return API_HASH_STATE
 
     context.user_data["api_hash"] = text
+    context.user_data["saved_api_hash"] = text
     await update.effective_message.reply_text(
         (
             f"Paste between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line).\n"
@@ -272,6 +352,7 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     context.user_data["sessions"] = valid
+    context.user_data["saved_sessions"] = valid
     if invalid:
         await update.effective_message.reply_text(f"Ignored {len(invalid)} invalid session(s); using {len(valid)} valid ones.")
 
@@ -570,6 +651,7 @@ def build_app() -> Application:
             API_ID_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)],
             API_HASH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash)],
             REPORT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sessions)],
+            SESSION_MODE: [CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:")],
             TARGET_KIND: [CallbackQueryHandler(handle_target_kind, pattern=r"^kind:")],
             REPORT_URLS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_urls)],
             REPORT_REASON_TYPE: [CallbackQueryHandler(handle_reason_type, pattern=r"^reason:")],
