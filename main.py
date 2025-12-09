@@ -184,20 +184,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\nTap a control to begin."
     )
 
-    steps_card = (
-        "*Quick launch*\n"
-        "• API ID + API Hash → validate sessions (1-500).\n"
-        "• Drop up to 5 targets (groups, channels, or profiles).\n"
-        "• Pick the reason, add a short message, and choose report volume.\n"
-        "• Watch live status updates as reports go out."
-    )
-
     await update.effective_message.reply_text(
         greeting,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu_keyboard(saved_sessions, active_sessions),
     )
-    await update.effective_message.reply_text(steps_card, parse_mode=ParseMode.MARKDOWN)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -277,7 +268,9 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     saved_api_id = context.user_data.get("saved_api_id")
     saved_api_hash = context.user_data.get("saved_api_hash")
-    saved_sessions = context.user_data.get("saved_sessions", [])
+    saved_sessions = context.user_data.get("saved_sessions")
+    if saved_sessions is None:
+        saved_sessions = await data_store.get_sessions()
 
     # Reset conversation-specific values while keeping any previously stored credentials/sessions
     context.user_data.clear()
@@ -285,7 +278,7 @@ async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         context.user_data["saved_api_id"] = saved_api_id
         context.user_data["saved_api_hash"] = saved_api_hash
     if saved_sessions:
-        context.user_data["saved_sessions"] = saved_sessions
+        context.user_data["saved_sessions"] = list(saved_sessions)
 
     if saved_api_id and saved_api_hash:
         context.user_data["api_id"] = saved_api_id
