@@ -49,6 +49,10 @@ from storage import DataStore
     SESSION_MODE,
 ) = range(9)
 ADD_SESSIONS = 10
+PRIVATE_INVITE = 11
+PRIVATE_MESSAGE = 12
+PUBLIC_MESSAGE = 13
+STORY_URL = 14
 
 DEFAULT_REPORTS = 5000
 MIN_REPORTS = 500
@@ -112,10 +116,47 @@ def parse_links(text: str) -> list[str]:
 
 def is_valid_link(text: str) -> bool:
     text = text.strip()
-    if text.startswith("@"):  # username shorthand
-        return len(text) > 1
     parsed = urlparse(text if text.startswith("http") else f"https://{text}")
     return parsed.netloc.endswith("t.me") and len(parsed.path.strip("/")) > 0
+
+
+def parse_telegram_url(url: str) -> dict:
+    """Parse a Telegram URL into structured components."""
+
+    parsed = urlparse(url if url.startswith("http") else f"https://{url}")
+    path_parts = [p for p in parsed.path.split("/") if p]
+
+    if not parsed.netloc.endswith("t.me") or not path_parts:
+        raise ValueError("Invalid Telegram URL")
+
+    if path_parts[0].startswith("+"):
+        return {"type": "invite", "invite_link": f"https://t.me/{path_parts[0]}"}
+
+    if path_parts[0] == "c" and len(path_parts) >= 3:
+        return {
+            "type": "private_message",
+            "chat_id": int(f"-100{path_parts[1]}"),
+            "message_id": int(path_parts[2]),
+        }
+
+    if len(path_parts) >= 3 and path_parts[1] in {"s", "story"}:
+        return {
+            "type": "story",
+            "username": path_parts[0],
+            "story_id": path_parts[2],
+        }
+
+    if len(path_parts) >= 2:
+        return {
+            "type": "public_message",
+            "username": path_parts[0],
+            "message_id": int(path_parts[1]),
+        }
+
+    if len(path_parts) == 1:
+        return {"type": "username", "username": path_parts[0]}
+
+    raise ValueError("Unrecognized Telegram URL format")
 
 
 def extract_target_identifier(text: str) -> str:
@@ -178,9 +219,9 @@ def main_menu_keyboard(saved_sessions: int = 0, active_sessions: int = 0, live_s
 def target_kind_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Private group", callback_data="kind:private")],
-            [InlineKeyboardButton("Public group / channel", callback_data="kind:public")],
-            [InlineKeyboardButton("Profile / story", callback_data="kind:profile")],
+            [InlineKeyboardButton("Private Channel / Private Group", callback_data="kind:private")],
+            [InlineKeyboardButton("Public Channel / Public Group", callback_data="kind:public")],
+            [InlineKeyboardButton("Story URL (Profile Story)", callback_data="kind:story")],
         ]
     )
 
@@ -453,18 +494,32 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_target_kind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    flow_state(context)["target_kind"] = query.data
+    kind = query.data
+    flow_state(context)["target_kind"] = kind
+
+    if kind == "kind:private":
+        await query.edit_message_text(
+            "Send the private channel/group invite link (e.g., https://t.me/+xxxx)."
+        )
+        return PRIVATE_INVITE
+
+    if kind == "kind:public":
+        await query.edit_message_text(
+            "Send the public message link (e.g., https://t.me/channelusername/1234)."
+        )
+        return PUBLIC_MESSAGE
+
     await query.edit_message_text(
-        "Send up to 5 Telegram URLs or @usernames to report (separated by spaces or new lines)."
+        "Send the story URL (profile story link)."
     )
-    return REPORT_URLS
+    return STORY_URL
 
 
 async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     links = parse_links(update.message.text or "")
     if not links:
         await update.effective_message.reply_text(
-            friendly_error("Please share at least one valid Telegram link or @username (max 5).")
+            friendly_error("Please share at least one valid Telegram link (max 5).")
         )
         return REPORT_URLS
 
@@ -481,6 +536,125 @@ async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE)
     flow["targets"] = links
     await update.effective_message.reply_text("Select the report type.", reply_markup=reason_keyboard())
     return REPORT_REASON_TYPE
+
+
+async def _validate_and_continue(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target_link: str,
+    *,
+    next_state_on_failure: int,
+) -> int:
+    flow = flow_state(context)
+    sessions = flow.get("sessions", [])
+    api_id = flow.get("api_id") or config.API_ID
+    api_hash = flow.get("api_hash") or config.API_HASH
+
+    valid, error_text = await validate_targets([target_link], sessions, api_id, api_hash)
+    if not valid:
+        await update.effective_message.reply_text(
+            friendly_error(error_text or "Unable to validate the provided link."),
+        )
+        return next_state_on_failure
+
+    flow["targets"] = [target_link]
+    await update.effective_message.reply_text("Select the report type.", reply_markup=reason_keyboard())
+    return REPORT_REASON_TYPE
+
+
+async def handle_private_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    link = (update.message.text or "").strip()
+    try:
+        details = parse_telegram_url(link)
+    except Exception:
+        await update.effective_message.reply_text(
+            friendly_error("That does not look like a valid invite link. Please send a link like https://t.me/+xxxx."),
+        )
+        return PRIVATE_INVITE
+
+    if details.get("type") != "invite":
+        await update.effective_message.reply_text(
+            friendly_error("Please provide a private invite link that starts with https://t.me/+"),
+        )
+        return PRIVATE_INVITE
+
+    flow_state(context)["invite_link"] = link
+    await update.effective_message.reply_text(
+        "Now send the message link from that private chat (e.g., https://t.me/c/123456789/45)."
+    )
+    return PRIVATE_MESSAGE
+
+
+async def handle_private_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    link = (update.message.text or "").strip()
+    try:
+        details = parse_telegram_url(link)
+    except Exception:
+        await update.effective_message.reply_text(
+            friendly_error("That does not look like a valid private message link."),
+        )
+        return PRIVATE_MESSAGE
+
+    if details.get("type") != "private_message":
+        await update.effective_message.reply_text(
+            friendly_error("Please send a private message link in the form https://t.me/c/123456789/45."),
+        )
+        return PRIVATE_MESSAGE
+
+    return await _validate_and_continue(
+        update,
+        context,
+        link,
+        next_state_on_failure=PRIVATE_MESSAGE,
+    )
+
+
+async def handle_public_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    link = (update.message.text or "").strip()
+    try:
+        details = parse_telegram_url(link)
+    except Exception:
+        await update.effective_message.reply_text(
+            friendly_error("That is not a valid public message link."),
+        )
+        return PUBLIC_MESSAGE
+
+    if details.get("type") != "public_message":
+        await update.effective_message.reply_text(
+            friendly_error("Send a public message link like https://t.me/channelusername/1234."),
+        )
+        return PUBLIC_MESSAGE
+
+    return await _validate_and_continue(
+        update,
+        context,
+        link,
+        next_state_on_failure=PUBLIC_MESSAGE,
+    )
+
+
+async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    link = (update.message.text or "").strip()
+    try:
+        details = parse_telegram_url(link)
+    except Exception:
+        await update.effective_message.reply_text(
+            friendly_error("That is not a valid story URL."),
+        )
+        return STORY_URL
+
+    if details.get("type") not in {"story", "username", "public_message"}:
+        await update.effective_message.reply_text(
+            friendly_error("Send a profile story link from t.me."),
+        )
+        return STORY_URL
+
+    return await _validate_and_continue(
+        update,
+        context,
+        link,
+        next_state_on_failure=STORY_URL,
+    )
 
 
 async def handle_reason_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -625,23 +799,34 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
 
 
 async def resolve_chat_id(client: Client, target: str):
-    """Resolve a Telegram username or link to a numeric chat ID.
+    """Resolve a Telegram link to a numeric chat ID using Pyrogram helpers."""
 
-    The function accepts usernames with or without a leading ``@`` and uses
-    ``Client.get_users`` to avoid deprecated resolution methods. Clear error
-    messages are propagated for callers to present to end users.
-    """
+    details = parse_telegram_url(target)
 
-    identifier = extract_target_identifier(target).lstrip("@")
+    if details["type"] == "invite":
+        chat = await client.get_chat(details["invite_link"])
+        return chat.id
 
-    try:
-        user = await client.get_users(identifier)
-    except UsernameNotOccupied as exc:
-        raise UsernameNotOccupied(f"Username '{identifier}' is not occupied") from exc
-    except (BadRequest, RPCError) as exc:
-        raise exc
+    if details["type"] == "private_message":
+        chat_id = details["chat_id"]
+        await client.get_chat(chat_id)
+        await client.get_messages(chat_id, details["message_id"])
+        return chat_id
 
-    return user.id if not isinstance(user, list) else user[0].id
+    if details["type"] == "public_message":
+        chat = await client.get_chat(details["username"])
+        await client.get_messages(chat.id, details["message_id"])
+        return chat.id
+
+    if details["type"] == "story":
+        chat = await client.get_chat(details["username"])
+        return chat.id
+
+    if details["type"] == "username":
+        chat = await client.get_chat(details["username"])
+        return chat.id
+
+    raise BadRequest("Unsupported Telegram link format")
 
 
 async def validate_targets(targets: list[str], sessions: list[str], api_id: int | None, api_hash: str | None) -> tuple[bool, str | None]:
@@ -675,6 +860,8 @@ async def validate_targets(targets: list[str], sessions: list[str], api_id: int 
             except UsernameNotOccupied:
                 return False, f"The username or link '{target}' is not occupied. Please check it."
             except BadRequest as exc:
+                return False, f"The link '{target}' is not valid: {exc}."
+            except ValueError as exc:
                 return False, f"The link '{target}' is not valid: {exc}."
             except RPCError as exc:
                 return False, f"Could not resolve '{target}' ({exc})."
@@ -863,6 +1050,10 @@ def build_app() -> Application:
             SESSION_MODE: [CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:")],
             TARGET_KIND: [CallbackQueryHandler(handle_target_kind, pattern=r"^kind:")],
             REPORT_URLS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_urls)],
+            PRIVATE_INVITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_invite)],
+            PRIVATE_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_message_link)],
+            PUBLIC_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_public_message_link)],
+            STORY_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_story_url)],
             REPORT_REASON_TYPE: [CallbackQueryHandler(handle_reason_type, pattern=r"^reason:")],
             REPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason_message)],
             REPORT_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_count)],
