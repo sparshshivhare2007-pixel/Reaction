@@ -862,8 +862,9 @@ async def validate_targets(targets: list[str], sessions: list[str], api_id: int 
                 try:
                     await resolve_chat_id(client, target)
                 except UsernameNotOccupied:
-                    last_error = f"The username or link '{target}' is not occupied. Please check it."
-                    raise
+                    # This error is deterministic for the target, so do not waste time
+                    # retrying with other sessions. Surface it immediately.
+                    return False, f"The username or link '{target}' is not occupied. Please check it."
                 except BadRequest as exc:
                     last_error = f"The link '{target}' is not valid: {exc}."
                     raise
