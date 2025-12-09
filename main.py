@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Iterable, List
@@ -64,6 +65,15 @@ def ensure_token() -> str:
 def ensure_pyrogram_creds() -> None:
     if not (config.API_ID and config.API_HASH):
         raise RuntimeError("API_ID and API_HASH are required for Pyrogram sessions")
+
+
+def verify_author_integrity(author_name: str, expected_hash: str) -> None:
+    """Verify the stored author hash matches the provided author name."""
+
+    computed_hash = hashlib.sha256(author_name.encode("utf-8")).hexdigest()
+    if computed_hash != expected_hash:
+        print("Integrity check failed: unauthorized modification.")
+        raise SystemExit(1)
 
 
 def main_menu_keyboard(saved_sessions: int = 0, active_sessions: int = 0, live_status: str = "Live") -> InlineKeyboardMarkup:
@@ -763,6 +773,7 @@ def build_app() -> Application:
 
 
 def main() -> None:
+    verify_author_integrity(config.AUTHOR_NAME, config.AUTHOR_HASH)
     build_logger()
     app = build_app()
 
