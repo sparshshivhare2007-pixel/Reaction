@@ -17,7 +17,7 @@ from typing import Iterable, List
 from urllib.parse import urlparse
 
 from pyrogram import Client
-from pyrogram.errors import BadRequest, FloodWait, RPCError
+from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -661,7 +661,7 @@ async def perform_reporting(
     try:
         try:
             chat_id = await resolve_chat_id(clients[0], target)
-        except (BadRequest, RPCError) as exc:
+        except (BadRequest, RPCError, UsernameNotOccupied) as exc:
             return {"success": 0, "failed": 0, "halted": True, "error": str(exc)}
 
         success = 0
