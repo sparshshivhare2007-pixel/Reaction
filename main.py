@@ -529,7 +529,7 @@ async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE)
     api_id = flow.get("api_id") or config.API_ID
     api_hash = flow.get("api_hash") or config.API_HASH
 
-    valid, error_text = await validate_targets(links, sessions, api_id, api_hash)
+    valid, error_text = await validate_targets(links, sessions, api_id, api_hash, flow.get("invite_link"))
     if not valid:
         await update.effective_message.reply_text(friendly_error(error_text or "Unable to validate the provided links."))
         return REPORT_URLS
@@ -550,8 +550,9 @@ async def _validate_and_continue(
     sessions = flow.get("sessions", [])
     api_id = flow.get("api_id") or config.API_ID
     api_hash = flow.get("api_hash") or config.API_HASH
+    invite_link = flow.get("invite_link")
 
-    valid, error_text = await validate_targets([target_link], sessions, api_id, api_hash)
+    valid, error_text = await validate_targets([target_link], sessions, api_id, api_hash, invite_link)
     if not valid:
         await update.effective_message.reply_text(
             friendly_error(error_text or "Unable to validate the provided link."),
@@ -757,7 +758,14 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
         started = datetime.now(timezone.utc)
         try:
             summary = await perform_reporting(
-                target, reasons, count, sessions, api_id=api_id, api_hash=api_hash, reason_code=reason_code
+                target,
+                reasons,
+                count,
+                sessions,
+                api_id=api_id,
+                api_hash=api_hash,
+                reason_code=reason_code,
+                invite_link=job_data.get("invite_link"),
             )
         except Exception as exc:  # pragma: no cover - runtime safety
             logging.exception("Failed to complete reporting job")
@@ -799,7 +807,7 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     await context.bot.send_message(chat_id=chat_id, text="\n\n".join(messages))
 
 
-async def resolve_chat_id(client: Client, target: str):
+async def resolve_chat_id(client: Client, target: str, invite_link: str | None = None):
     """Resolve a Telegram link to a numeric chat ID using Pyrogram helpers."""
 
     details = parse_telegram_url(target)
@@ -809,6 +817,8 @@ async def resolve_chat_id(client: Client, target: str):
         return chat.id
 
     if details["type"] == "private_message":
+        if invite_link:
+            await client.join_chat(invite_link)
         chat_id = details["chat_id"]
         await client.get_chat(chat_id)
         await client.get_messages(chat_id, details["message_id"])
@@ -830,7 +840,13 @@ async def resolve_chat_id(client: Client, target: str):
     raise BadRequest("Unsupported Telegram link format")
 
 
-async def validate_targets(targets: list[str], sessions: list[str], api_id: int | None, api_hash: str | None) -> tuple[bool, str | None]:
+async def validate_targets(
+    targets: list[str],
+    sessions: list[str],
+    api_id: int | None,
+    api_hash: str | None,
+    invite_link: str | None = None,
+) -> tuple[bool, str | None]:
     """Confirm each target link or username resolves before starting reports."""
 
     if not targets:
@@ -860,7 +876,7 @@ async def validate_targets(targets: list[str], sessions: list[str], api_id: int 
 
             for target in targets:
                 try:
-                    await resolve_chat_id(client, target)
+                    await resolve_chat_id(client, target, invite_link)
                 except UsernameNotOccupied:
                     # The current session may not have access to the target. Try the next
                     # session before surfacing the error back to the user.
@@ -900,6 +916,7 @@ async def perform_reporting(
     api_hash: str | None,
     reason_code: int = 5,
     max_concurrency: int = 25,
+    invite_link: str | None = None,
 ) -> dict:
     """Send repeated report requests with bounded concurrency."""
     if not (api_id and api_hash):
@@ -934,7 +951,7 @@ async def perform_reporting(
 
         for client in clients:
             try:
-                chat_id = await resolve_chat_id(client, target)
+                chat_id = await resolve_chat_id(client, target, invite_link)
                 break
             except UsernameNotOccupied:
                 last_error = (
