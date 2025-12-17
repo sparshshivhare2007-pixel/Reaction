@@ -81,6 +81,10 @@ def build_logger() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     )
+    # Silence verbose library logs that include sensitive URLs (e.g., bot token
+    # query strings) to avoid leaking credentials in plain text output.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 def ensure_token() -> str:
