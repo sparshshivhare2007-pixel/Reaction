@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telegram.error import NetworkError
@@ -118,13 +119,23 @@ def build_app() -> Application:
     return application
 
 
-async def run_polling(application: Application) -> None:
+async def run_polling(application: Application, shutdown_event: asyncio.Event) -> None:
+    """Run the bot until ``shutdown_event`` is set."""
+
     try:
         logging.info("Bot started and polling.")
-        await application.run_polling()
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+
+        await shutdown_event.wait()
     except NetworkError as exc:
         logging.error("Failed to connect to Telegram: %s", exc)
         raise SystemExit(1) from exc
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 __all__ = ["build_app", "run_polling"]
