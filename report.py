@@ -41,11 +41,11 @@ def _build_reason(reason: int | object, message: str) -> object:
     try:
         reason_int = int(reason)
     except Exception:
-        return InputReportReasonOther(text=message[:512] if message else "")
+        return InputReportReasonOther()
 
     reason_cls = reason_map.get(reason_int, InputReportReasonOther)
     if reason_cls is InputReportReasonOther:
-        return reason_cls(text=message[:512] if message else "")
+        return reason_cls()
 
     return reason_cls()
 

@@ -77,6 +77,25 @@ class DataStore:
         else:
             self._in_memory_reports.append(payload)
 
+    async def remove_sessions(self, sessions: Iterable[str]) -> int:
+        """Remove sessions from persistence, returning the count removed."""
+
+        targets = {s for s in sessions if s}
+        if not targets:
+            return 0
+
+        removed = 0
+        if self.db:
+            result = await self.db.sessions.delete_many({"session": {"$in": list(targets)}})
+            removed = getattr(result, "deleted_count", 0)
+        else:
+            for session in list(targets):
+                if session in self._in_memory_sessions:
+                    self._in_memory_sessions.discard(session)
+                    removed += 1
+
+        return removed
+
     async def close(self) -> None:
         if self.client:
             self.client.close()
