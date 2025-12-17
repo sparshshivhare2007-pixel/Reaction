@@ -1,120 +1,178 @@
 from __future__ import annotations
 
+import textwrap
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.constants import MENU_LIVE_STATUS, MAX_SESSIONS, MIN_SESSIONS, REASON_LABELS
+from bot.constants import MENU_LIVE_STATUS, REASON_LABELS
 
-CARD_WIDTH = 86
+# Mobile-friendly: 70–78 looks best in Telegram monospace blocks
+CARD_WIDTH = 74
 
 
-def render_card(title: str, body_lines: list[str] | tuple[str, ...], footer_lines: list[str] | tuple[str, ...] | None = None) -> str:
-    body_lines = list(body_lines)
-    footer_lines = list(footer_lines or [])
-    hint = "If you’re facing any issues, tap 🔄 Restart Bot or type /restart"
-    if hint not in footer_lines:
+# -----------------------------
+# Card rendering (clean + pro)
+# -----------------------------
+def render_card(
+    title: str,
+    body: list[str] | tuple[str, ...],
+    footer: list[str] | tuple[str, ...] | None = None,
+    *,
+    hint: str = "Help: 🔄 Restart or /restart",
+) -> str:
+    title = (title or "").strip()
+    body_lines = list(body)
+    footer_lines = list(footer or [])
+
+    if hint and hint not in footer_lines:
         footer_lines.append(hint)
 
-    def _pad_line(content: str) -> str:
-        trimmed = content[: CARD_WIDTH - 4]
-        padding = " " * (CARD_WIDTH - 4 - len(trimmed))
-        return f"│ {trimmed}{padding} │"
+    inner = CARD_WIDTH - 4  # │ <inner> │
 
-    title_space = CARD_WIDTH - len(title) - 4
-    left = max(2, title_space // 2)
-    right = max(2, CARD_WIDTH - len(title) - 2 - left)
-    top = f"┌{'─' * left} {title} {'─' * right}┐"
+    def wrap_lines(lines: list[str]) -> list[str]:
+        out: list[str] = []
+        for line in lines:
+            line = "" if line is None else str(line)
+            if not line.strip():
+                out.append("")
+                continue
+            out.extend(
+                textwrap.wrap(
+                    line,
+                    width=inner,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+            )
+        return out
+
+    def row(s: str) -> str:
+        s = (s or "")[:inner]
+        return f"│ {s}{' ' * (inner - len(s))} │"
+
+    # Title bar (centered)
+    # ┌──── Title ────┐
+    title_block = f" {title} " if title else " "
+    dash_space = (CARD_WIDTH - 2) - len(title_block)
+    left = max(1, dash_space // 2)
+    right = max(1, dash_space - left)
+    top = f"┌{'─' * left}{title_block}{'─' * right}┐"
+
     divider = f"├{'─' * (CARD_WIDTH - 2)}┤"
     bottom = f"└{'─' * (CARD_WIDTH - 2)}┘"
 
-    lines = [top]
-    lines.extend(_pad_line(line) for line in body_lines)
+    b = wrap_lines(body_lines)
+    f = wrap_lines(footer_lines)
+
+    lines: list[str] = [top]
+    lines.extend(row(x) for x in b)
     lines.append(divider)
-    lines.extend(_pad_line(line) for line in footer_lines)
+    lines.extend(row(x) for x in f)
     lines.append(bottom)
     return "\n".join(lines)
 
 
-def _with_restart_row(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
-    rows = [list(r) for r in rows]
-    rows.append([InlineKeyboardButton("🔄 Restart Bot", callback_data="restart")])
+# -----------------------------
+# Keyboard helpers
+# -----------------------------
+def _restart_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton("🔄 Restart", callback_data="restart")]
+
+
+def with_restart(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if markup is not None:
+        rows = [list(r) for r in markup.inline_keyboard]
+    rows.append(_restart_row())
     return InlineKeyboardMarkup(rows)
 
 
-def add_restart_button(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
-    if markup is None:
-        return _with_restart_row([])
-    return _with_restart_row(markup.inline_keyboard)
-
-
-def main_menu_keyboard(saved_sessions: int = 0, active_sessions: int = 0, live_status: str = MENU_LIVE_STATUS) -> InlineKeyboardMarkup:
-    return _with_restart_row(
+# -----------------------------
+# Main menu (best layout)
+# -----------------------------
+def main_menu_keyboard(
+    saved_sessions: int = 0,
+    active_sessions: int = 0,
+    live_status: str = MENU_LIVE_STATUS,
+) -> InlineKeyboardMarkup:
+    # Short labels = cleaner UI on mobile
+    rows = [
+        [InlineKeyboardButton("▶ Start Report", callback_data="action:start")],
         [
-            [InlineKeyboardButton("🚀 Start report", callback_data="action:start")],
-            [InlineKeyboardButton("🧩 Add sessions", callback_data="action:add")],
-            [InlineKeyboardButton("💾 Saved sessions", callback_data="action:sessions")],
-            [
-                InlineKeyboardButton(f"🟢 {live_status} · Dark UI", callback_data="status:live"),
-                InlineKeyboardButton(f"🎯 Loaded: {active_sessions}", callback_data="status:active"),
-                InlineKeyboardButton(f"📦 Saved: {saved_sessions}", callback_data="status:saved"),
-            ],
-        ]
-    )
+            InlineKeyboardButton("➕ Add Sessions", callback_data="action:add"),
+            InlineKeyboardButton("💾 Saved", callback_data="action:sessions"),
+        ],
+        [
+            InlineKeyboardButton(f"🟢 {live_status}", callback_data="status:live"),
+            InlineKeyboardButton(f"🎯 {active_sessions}", callback_data="status:active"),
+            InlineKeyboardButton(f"📦 {saved_sessions}", callback_data="status:saved"),
+        ],
+    ]
+    rows.append(_restart_row())
+    return InlineKeyboardMarkup(rows)
 
 
+# -----------------------------
+# Target kind (clean naming)
+# -----------------------------
 def target_kind_keyboard() -> InlineKeyboardMarkup:
-    return _with_restart_row(
-        [
-            [InlineKeyboardButton("Private Channel / Private Group", callback_data="kind:private")],
-            [InlineKeyboardButton("Public Channel / Public Group", callback_data="kind:public")],
-            [InlineKeyboardButton("Story URL (Profile Story)", callback_data="kind:story")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton("🔒 Private Channel / Group", callback_data="kind:private")],
+        [InlineKeyboardButton("🌐 Public Channel / Group", callback_data="kind:public")],
+        [InlineKeyboardButton("📎 Story URL (Profile)", callback_data="kind:story")],
+        _restart_row(),
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
+# -----------------------------
+# Reasons (balanced grid)
+# Keeps your callback_data mapping intact
+# -----------------------------
 def reason_keyboard() -> InlineKeyboardMarkup:
-    """Buttons covering the available Pyrogram/Telegram report reasons."""
-
+    # Your original ordering preserved (0,3,2,1,6,4,5)
+    ordered = [0, 3, 2, 1, 6, 4, 5]
     buttons = [
-        InlineKeyboardButton(REASON_LABELS[0], callback_data="reason:0"),
-        InlineKeyboardButton(REASON_LABELS[3], callback_data="reason:3"),
-        InlineKeyboardButton(REASON_LABELS[2], callback_data="reason:2"),
-        InlineKeyboardButton(REASON_LABELS[1], callback_data="reason:1"),
-        InlineKeyboardButton(REASON_LABELS[6], callback_data="reason:6"),
-        InlineKeyboardButton(REASON_LABELS[4], callback_data="reason:4"),
-        InlineKeyboardButton(REASON_LABELS[5], callback_data="reason:5"),
+        InlineKeyboardButton(REASON_LABELS[i], callback_data=f"reason:{i}")
+        for i in ordered
     ]
 
     rows = [
         buttons[0:2],
         buttons[2:4],
         buttons[4:6],
-        [buttons[6]],
+        buttons[6:7],
+        _restart_row(),
     ]
+    return InlineKeyboardMarkup(rows)
 
-    return _with_restart_row(rows)
 
-
+# -----------------------------
+# Session mode (pro wording)
+# -----------------------------
 def session_mode_keyboard() -> InlineKeyboardMarkup:
-    return _with_restart_row(
-        [
-            [InlineKeyboardButton("Report with saved sessions", callback_data="session_mode:reuse")],
-            [InlineKeyboardButton("Add new sessions", callback_data="session_mode:new")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton("Use Saved Sessions", callback_data="session_mode:reuse")],
+        [InlineKeyboardButton("Add New Sessions", callback_data="session_mode:new")],
+        _restart_row(),
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
+# -----------------------------
+# Greeting (professional copy)
+# -----------------------------
 def render_greeting() -> str:
     return render_card(
         "Nightfall Reporter",
         [
-            "Nightfall Reporter — premium chat cockpit engaged.",
-            "Polished bubbles, elevated reply cards, and tactile pill buttons are live.",
-            "Start reporting instantly with saved creds or add new sessions on the fly.",
-            "Dynamic status chips below keep you oriented as you move through each step.",
-            "Tap a control to begin.",
+            "Welcome.",
+            "Start with saved sessions, or add new sessions anytime.",
+            "Use the status chips to track readiness and loaded/saved sessions.",
+            "Choose an action below to continue.",
         ],
-        [],
+        footer=[],
     )
+
 
 __all__ = [
     "main_menu_keyboard",
@@ -123,5 +181,5 @@ __all__ = [
     "session_mode_keyboard",
     "render_greeting",
     "render_card",
-    "add_restart_button",
+    "with_restart",
 ]
