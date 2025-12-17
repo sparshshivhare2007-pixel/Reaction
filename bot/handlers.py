@@ -48,7 +48,15 @@ from bot.state import (
     reset_user_context,
     saved_session_count,
 )
-from bot.ui import add_restart_button, main_menu_keyboard, reason_keyboard, render_card, render_greeting, session_mode_keyboard, target_kind_keyboard
+from bot.ui import (
+    add_restart_button,
+    main_menu_keyboard,
+    reason_keyboard,
+    render_card,
+    render_greeting,
+    session_mode_keyboard,
+    target_kind_keyboard,
+)
 from bot.utils import (
     friendly_error,
     is_valid_link,
@@ -56,6 +64,7 @@ from bot.utils import (
     parse_reasons,
     parse_telegram_url,
     session_strings_from_text,
+    validate_sessions,
 )
 
 
@@ -109,6 +118,70 @@ async def _ensure_active_session(query, context: ContextTypes.DEFAULT_TYPE) -> b
     return False
 
 
+async def _validate_sessions_with_feedback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    sessions: list[str],
+    *,
+    api_id: int | None,
+    api_hash: str | None,
+    fallback_markup=None,
+) -> list[str]:
+    if not sessions:
+        await _notify_user(
+            update,
+            friendly_error("No sessions provided. Please add sessions to continue."),
+            reply_markup=fallback_markup,
+        )
+        return []
+
+    if not (api_id and api_hash):
+        await _notify_user(
+            update,
+            friendly_error("API credentials are missing. Please restart and set API ID/API Hash."),
+            reply_markup=fallback_markup,
+        )
+        return []
+
+    try:
+        valid, invalid = await validate_sessions(api_id, api_hash, sessions)
+    except Exception:
+        logging.exception("Session validation failed")
+        await _notify_user(
+            update,
+            friendly_error("Unable to validate sessions right now. Please try again."),
+            reply_markup=fallback_markup,
+        )
+        return []
+
+    if invalid:
+        removed = await data_store.remove_sessions(invalid)
+        card = render_card(
+            "Session validation",
+            [
+                f"Removed {len(invalid)} invalid session(s).",
+                f"{len(valid)} valid session(s) remain.",
+            ],
+            [f"Pruned from storage: {removed}"],
+        )
+        await _notify_user(
+            update,
+            f"<pre>{card}</pre>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=fallback_markup,
+        )
+
+    if not valid:
+        await _notify_user(
+            update,
+            friendly_error("All provided sessions are invalid. Please add new sessions."),
+            reply_markup=fallback_markup,
+        )
+        return []
+
+    return valid
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reset_user_context(context, update.effective_user.id if update.effective_user else None)
     profile = profile_state(context)
@@ -136,10 +209,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     await update.effective_message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
-
-def _is_admin(update: Update) -> bool:
-    user_id = update.effective_user.id if update.effective_user else None
-    return bool(user_id and user_id in getattr(config, "ADMIN_IDS", set()))
+async def _notify_user(
+    update: Update,
+    text: str,
+    *,
+    reply_markup=None,
+    parse_mode=None,
+):
+    if update.callback_query:
+        return await safe_edit_message(
+            update.callback_query, text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+    return await update.effective_message.reply_text(
+        text, reply_markup=reply_markup, parse_mode=parse_mode
+    )
 
 
 async def uptime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -192,9 +275,10 @@ async def _send_restart_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Admins can still request a full process restart via "/restart bot".
-    if _is_admin(update) and getattr(context, "args", None) and context.args and context.args[0].lower() == "bot":
-        await update.effective_message.reply_text("Restarting… I will be back shortly.")
+    # Any user can request a full process restart via "/restart bot" for reliability.
+    if getattr(context, "args", None) and context.args and context.args[0].lower() == "bot":
+        logging.info("Restart requested by %s (%s)", update.effective_user, update.effective_user.id if update.effective_user else "unknown")
+        await update.effective_message.reply_text("Restarting… I will be back shortly for everyone.")
         SchedulerManager.shutdown()
         context.bot_data["restart_requested"] = True
         shutdown_event = context.bot_data.get("shutdown_event")
@@ -273,15 +357,26 @@ async def handle_report_again(update: Update, context: ContextTypes.DEFAULT_TYPE
     flow = reset_flow_state(context)
     flow["sessions"] = list(last_config.get("sessions") or profile.get("saved_sessions") or [])
 
-    if last_config.get("api_id"):
-        flow["api_id"] = last_config["api_id"]
-    elif profile.get("api_id"):
-        flow["api_id"] = profile["api_id"]
+    api_id = last_config.get("api_id") or profile.get("api_id") or config.API_ID
+    api_hash = last_config.get("api_hash") or profile.get("api_hash") or config.API_HASH
 
-    if last_config.get("api_hash"):
-        flow["api_hash"] = last_config["api_hash"]
-    elif profile.get("api_hash"):
-        flow["api_hash"] = profile["api_hash"]
+    if api_id:
+        flow["api_id"] = api_id
+    if api_hash:
+        flow["api_hash"] = api_hash
+
+    valid_sessions = await _validate_sessions_with_feedback(
+        update,
+        context,
+        flow["sessions"],
+        api_id=api_id,
+        api_hash=api_hash,
+        fallback_markup=main_menu_keyboard(saved_session_count(context), active_session_count(context)),
+    )
+    if not valid_sessions:
+        return ConversationHandler.END
+
+    flow["sessions"] = valid_sessions
 
     await safe_edit_message(
         query,
@@ -320,7 +415,19 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
 
         flow["sessions"] = list(saved_sessions)
-        session_preview = _format_sessions_for_copy(saved_sessions)
+        valid_sessions = await _validate_sessions_with_feedback(
+            update,
+            context,
+            flow["sessions"],
+            api_id=flow.get("api_id") or profile.get("api_id") or config.API_ID,
+            api_hash=flow.get("api_hash") or profile.get("api_hash") or config.API_HASH,
+            fallback_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+        )
+        if not valid_sessions:
+            return ConversationHandler.END
+
+        flow["sessions"] = valid_sessions
+        session_preview = _format_sessions_for_copy(valid_sessions)
         await safe_edit_message(
             query,
             f"Using your saved sessions:\n\n{session_preview}\n\nWhat are you reporting?",
@@ -405,7 +512,20 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         flow = flow_state(context)
         flow["sessions"] = list(saved_sessions)
-        session_preview = _format_sessions_for_copy(saved_sessions)
+
+        valid_sessions = await _validate_sessions_with_feedback(
+            update,
+            context,
+            flow["sessions"],
+            api_id=flow.get("api_id") or profile.get("api_id") or config.API_ID,
+            api_hash=flow.get("api_hash") or profile.get("api_hash") or config.API_HASH,
+            fallback_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+        )
+        if not valid_sessions:
+            return ConversationHandler.END
+
+        flow["sessions"] = valid_sessions
+        session_preview = _format_sessions_for_copy(valid_sessions)
         await update.effective_message.reply_text(
             f"Using your saved sessions:\n\n{session_preview}\n\nWhat are you reporting?",
             reply_markup=target_kind_keyboard(),
@@ -422,7 +542,20 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return REPORT_SESSIONS
 
     flow = flow_state(context)
-    flow["sessions"] = sessions
+
+    valid_sessions = await _validate_sessions_with_feedback(
+        update,
+        context,
+        sessions,
+        api_id=flow.get("api_id") or profile.get("api_id") or config.API_ID,
+        api_hash=flow.get("api_hash") or profile.get("api_hash") or config.API_HASH,
+        fallback_markup=main_menu_keyboard(saved_session_count(context), active_session_count(context)),
+    )
+
+    if not valid_sessions:
+        return REPORT_SESSIONS
+
+    flow["sessions"] = valid_sessions
     await update.effective_message.reply_text("What are you reporting?", reply_markup=target_kind_keyboard())
     return TARGET_KIND
 
