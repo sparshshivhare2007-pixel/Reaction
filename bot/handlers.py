@@ -5,9 +5,11 @@ import os
 import sys
 import time
 from copy import deepcopy
+from html import escape
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 import config
@@ -54,6 +56,56 @@ from bot.utils import (
     parse_telegram_url,
     session_strings_from_text,
 )
+
+
+async def safe_edit_message(query, text: str, *, reply_markup=None, parse_mode=None, **kwargs):
+    current = query.message
+    html_text = getattr(current, "text_html", None)
+    current_text = (html_text if parse_mode == ParseMode.HTML else current.text) or ""
+    current_markup = current.reply_markup
+    current_markup_dict = current_markup.to_dict() if current_markup else None
+    new_markup_dict = reply_markup.to_dict() if reply_markup else None
+
+    if current_text == text and current_markup_dict == new_markup_dict:
+        return current
+
+    try:
+        return await query.edit_message_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs
+        )
+    except BadRequest as exc:
+        if "Message is not modified" in str(exc):
+            return current
+        raise
+
+
+def _format_sessions_for_copy(sessions: list[str], *, max_items: int = 10) -> str:
+    lines = [f"<code>{escape(session)}</code>" for session in sessions[:max_items]]
+    remaining = len(sessions) - max_items
+    if remaining > 0:
+        lines.append(f"…and {remaining} more session(s).")
+    return "\n".join(lines)
+
+
+async def _ensure_active_session(query, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    flow = flow_state(context)
+    if flow.get("sessions"):
+        return True
+
+    profile = profile_state(context)
+    profile.setdefault("saved_sessions", await data_store.get_sessions())
+    saved_sessions = profile.get("saved_sessions") or []
+
+    if saved_sessions:
+        flow["sessions"] = list(saved_sessions)
+        return True
+
+    await safe_edit_message(
+        query,
+        friendly_error("Please add a new session"),
+        reply_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+    )
+    return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,12 +214,12 @@ async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     if query.data == "action:start":
         return await start_report(update, context)
     if query.data == "action:add":
-        await query.edit_message_text(f"Send {MIN_SESSIONS}-{MAX_SESSIONS} Pyrogram session strings, one per line.")
+        await safe_edit_message(query, f"Send {MIN_SESSIONS}-{MAX_SESSIONS} Pyrogram session strings, one per line.")
         return ADD_SESSIONS
     if query.data == "action:sessions":
         saved = len(await data_store.get_sessions())
         active = active_session_count(context)
-        await query.edit_message_text(
+        await safe_edit_message(
             f"Saved sessions: {saved}\nCurrently loaded for this chat: {active}",
             reply_markup=main_menu_keyboard(saved, active),
         )
@@ -196,22 +248,27 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.data == "session_mode:reuse":
         saved_sessions = profile.get("saved_sessions", [])
         if not saved_sessions:
-            await query.edit_message_text(
+            await safe_edit_message(
+                query,
                 friendly_error("No saved sessions available. Please add new sessions to continue."),
                 reply_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
             )
             return ConversationHandler.END
 
         flow["sessions"] = list(saved_sessions)
-        await query.edit_message_text(
-            "Using your saved sessions. What are you reporting?",
+        session_preview = _format_sessions_for_copy(saved_sessions)
+        await safe_edit_message(
+            query,
+            f"Using your saved sessions:\n\n{session_preview}\n\nWhat are you reporting?",
             reply_markup=target_kind_keyboard(),
+            parse_mode=ParseMode.HTML,
         )
         return TARGET_KIND
 
     flow["sessions"] = []
-    await query.edit_message_text(
-        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line)."
+    await safe_edit_message(
+        query,
+        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line).",
     )
     return REPORT_SESSIONS
 
@@ -284,7 +341,12 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         flow = flow_state(context)
         flow["sessions"] = list(saved_sessions)
-        await update.effective_message.reply_text("Using your saved sessions. What are you reporting?", reply_markup=target_kind_keyboard())
+        session_preview = _format_sessions_for_copy(saved_sessions)
+        await update.effective_message.reply_text(
+            f"Using your saved sessions:\n\n{session_preview}\n\nWhat are you reporting?",
+            reply_markup=target_kind_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
         return TARGET_KIND
 
     sessions = session_strings_from_text(update.message.text or "")
@@ -305,15 +367,18 @@ async def handle_target_kind(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
+    if not await _ensure_active_session(query, context):
+        return ConversationHandler.END
+
     if query.data == "kind:private":
-        await query.edit_message_text("Send the private invite link (https://t.me/+code)")
+        await safe_edit_message(query, "Send the private invite link (https://t.me/+code)")
         return PRIVATE_INVITE
 
     if query.data == "kind:public":
-        await query.edit_message_text("Send the public message link (https://t.me/username/1234)")
+        await safe_edit_message(query, "Send the public message link (https://t.me/username/1234)")
         return PUBLIC_MESSAGE
 
-    await query.edit_message_text("Send the story URL or username.")
+    await safe_edit_message(query, "Send the story URL or username.")
     return STORY_URL
 
 
@@ -404,10 +469,13 @@ async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_reason_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+
+    if not await _ensure_active_session(query, context):
+        return ConversationHandler.END
     reason_code = int(query.data.split(":")[1])
     flow_state(context)["reason_code"] = reason_code
 
-    await query.edit_message_text("Send a short reason for reporting (up to 5 lines).")
+    await safe_edit_message(query, "Send a short reason for reporting (up to 5 lines).")
     return REPORT_MESSAGE
 
 
@@ -467,11 +535,14 @@ async def handle_report_count(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+
+    if not await _ensure_active_session(query, context):
+        return ConversationHandler.END
     if query.data == "confirm:cancel":
-        await query.edit_message_text("Canceled. Use /report to start over.")
+        await safe_edit_message(query, "Canceled. Use /report to start over.")
         return ConversationHandler.END
 
-    await query.edit_message_text("Reporting has started. I'll send updates when done.")
+    await safe_edit_message(query, "Reporting has started. I'll send updates when done.")
 
     job_data = deepcopy(flow_state(context))
 
