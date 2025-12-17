@@ -55,6 +55,7 @@ from bot.handlers import (
     help_command,
     ping_command,
     restart_command,
+    restart_callback,
     receive_added_sessions,
     show_sessions,
     start,
@@ -120,6 +121,7 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("sessions", show_sessions))
     application.add_handler(add_sessions_conv)
     application.add_handler(report_conversation)
+    application.add_handler(CallbackQueryHandler(restart_callback, pattern=r"^restart$"))
     application.add_handler(CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"), group=1)
     application.add_handler(CallbackQueryHandler(handle_status_chip, pattern=r"^status:"))
     application.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:"))

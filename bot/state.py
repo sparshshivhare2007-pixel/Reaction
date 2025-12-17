@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from telegram.ext import ContextTypes
 
 
@@ -22,6 +24,16 @@ def clear_report_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("report", None)
 
 
+def reset_user_context(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = None) -> None:
+    """Clear any per-user report context and cancel running tasks."""
+
+    task = context.user_data.pop("active_report_task", None)
+    if isinstance(task, asyncio.Task) and not task.done():
+        task.cancel()
+
+    clear_report_state(context)
+
+
 def saved_session_count(context: ContextTypes.DEFAULT_TYPE) -> int:
     return len(profile_state(context).get("saved_sessions", []))
 
@@ -34,6 +46,7 @@ __all__ = [
     "flow_state",
     "reset_flow_state",
     "clear_report_state",
+    "reset_user_context",
     "saved_session_count",
     "active_session_count",
 ]

@@ -45,9 +45,10 @@ from bot.state import (
     flow_state,
     profile_state,
     reset_flow_state,
+    reset_user_context,
     saved_session_count,
 )
-from bot.ui import main_menu_keyboard, reason_keyboard, render_greeting, session_mode_keyboard, target_kind_keyboard
+from bot.ui import add_restart_button, main_menu_keyboard, reason_keyboard, render_card, render_greeting, session_mode_keyboard, target_kind_keyboard
 from bot.utils import (
     friendly_error,
     is_valid_link,
@@ -93,7 +94,7 @@ async def _ensure_active_session(query, context: ContextTypes.DEFAULT_TYPE) -> b
         return True
 
     profile = profile_state(context)
-    profile.setdefault("saved_sessions", await data_store.get_sessions())
+    profile["saved_sessions"] = await data_store.get_sessions()
     saved_sessions = profile.get("saved_sessions") or []
 
     if saved_sessions:
@@ -109,14 +110,15 @@ async def _ensure_active_session(query, context: ContextTypes.DEFAULT_TYPE) -> b
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reset_user_context(context, update.effective_user.id if update.effective_user else None)
     profile = profile_state(context)
-    profile.setdefault("saved_sessions", await data_store.get_sessions())
+    profile["saved_sessions"] = await data_store.get_sessions()
 
     greeting = render_greeting()
 
     await update.effective_message.reply_text(
-        greeting,
-        parse_mode=ParseMode.MARKDOWN,
+        f"<pre>{greeting}</pre>",
+        parse_mode=ParseMode.HTML,
         reply_markup=main_menu_keyboard(len(profile["saved_sessions"]), active_session_count(context)),
     )
 
@@ -171,20 +173,45 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _send_restart_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    profile = profile_state(context)
+    profile["saved_sessions"] = await data_store.get_sessions()
+    greeting = render_greeting()
+    markup = main_menu_keyboard(len(profile.get("saved_sessions", [])), active_session_count(context))
+
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer("Restarted.")
+        await safe_edit_message(query, f"<pre>{greeting}</pre>", parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(
+            f"<pre>{greeting}</pre>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+
+
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await update.effective_message.reply_text("You are not authorized to restart this bot.")
+    # Admins can still request a full process restart via "/restart bot".
+    if _is_admin(update) and getattr(context, "args", None) and context.args and context.args[0].lower() == "bot":
+        await update.effective_message.reply_text("Restarting… I will be back shortly.")
+        SchedulerManager.shutdown()
+        context.bot_data["restart_requested"] = True
+        shutdown_event = context.bot_data.get("shutdown_event")
+        if shutdown_event:
+            shutdown_event.set()
+        else:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
         return
 
-    await update.effective_message.reply_text("Restarting… I will be back shortly.")
-    SchedulerManager.shutdown()
-    context.bot_data["restart_requested"] = True
-    shutdown_event = context.bot_data.get("shutdown_event")
-    if shutdown_event:
-        shutdown_event.set()
-    else:
-        # Fallback to exiting if no shutdown hook is registered
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+    reset_user_context(context, update.effective_user.id if update.effective_user else None)
+    await _send_restart_menu(update, context)
+
+
+async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reset_user_context(context, update.effective_user.id if update.effective_user else None)
+    await _send_restart_menu(update, context)
+    return ConversationHandler.END
 
 
 REASON_PROMPT = (
@@ -237,7 +264,7 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     profile = profile_state(context)
-    profile.setdefault("saved_sessions", await data_store.get_sessions())
+    profile["saved_sessions"] = await data_store.get_sessions()
     flow = flow_state(context)
 
     if "api_id" not in flow and profile.get("api_id"):
@@ -277,7 +304,7 @@ async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     profile = profile_state(context)
     flow = reset_flow_state(context)
 
-    profile.setdefault("saved_sessions", await data_store.get_sessions())
+    profile["saved_sessions"] = await data_store.get_sessions()
 
     saved_api_id = profile.get("api_id") or config.API_ID
     saved_api_hash = profile.get("api_hash") or config.API_HASH
@@ -522,11 +549,13 @@ async def handle_report_count(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.effective_message.reply_text(
         f"Confirm the report run?\n\n{summary}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Start", callback_data="confirm:start")],
-                [InlineKeyboardButton("Cancel", callback_data="confirm:cancel")],
-            ]
+        reply_markup=add_restart_button(
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Start", callback_data="confirm:start")],
+                    [InlineKeyboardButton("Cancel", callback_data="confirm:cancel")],
+                ]
+            )
         ),
     )
     return ConversationHandler.WAITING
@@ -546,7 +575,8 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     job_data = deepcopy(flow_state(context))
 
-    context.application.create_task(run_report_job(query, context, job_data))
+    task = context.application.create_task(run_report_job(query, context, job_data))
+    context.user_data["active_report_task"] = task
     clear_report_state(context)
     return ConversationHandler.END
 
@@ -585,7 +615,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.exception("Update %s caused error", update, exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("Something went wrong. Please try again later.")
+        card = render_card("Unexpected error", ["Something went wrong. Please try again later."], [])
+        await update.effective_message.reply_text(
+            f"<pre>{card}</pre>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=add_restart_button(None),
+        )
 
 
 __all__ = [
@@ -616,4 +651,5 @@ __all__ = [
     "uptime_command",
     "ping_command",
     "restart_command",
+    "restart_callback",
 ]
