@@ -4,7 +4,12 @@ import asyncio
 import logging
 from urllib.parse import urlparse
 
-from pyrogram.errors import PeerIdInvalid, UsernameInvalid, UsernameNotOccupied
+from pyrogram.errors import (
+    PeerIdInvalid,
+    RPCError,
+    UsernameInvalid,
+    UsernameNotOccupied,
+)
 
 from pyrogram import Client
 
@@ -45,6 +50,8 @@ def parse_telegram_url(url: str) -> dict:
         return {"type": "invite", "invite_link": f"https://t.me/{path_parts[0]}"}
 
     if path_parts[0] == "c" and len(path_parts) >= 3:
+        if not path_parts[1].isdigit() or not path_parts[2].isdigit():
+            raise ValueError("Invalid private message link")
         return {
             "type": "private_message",
             "chat_id": int(f"-100{path_parts[1]}"),
@@ -59,6 +66,8 @@ def parse_telegram_url(url: str) -> dict:
         }
 
     if len(path_parts) >= 2:
+        if not path_parts[1].isdigit():
+            raise ValueError("Invalid public message link")
         return {
             "type": "public_message",
             "username": path_parts[0],
@@ -205,12 +214,34 @@ async def resolve_target_peer(client: Client, target: str, invite_link: str | No
                     raise PeerIdInvalid(f"Invalid invite link target: {exc}") from exc
 
             if details.get("type") in {"public_message", "private_message"}:
+                chat_ref = details.get("username") or details.get("chat_id")
+                message_id = details.get("message_id")
+
                 try:
-                    chat = await client.get_chat(details.get("username") or details.get("chat_id"))
-                    await client.get_messages(chat.id, details.get("message_id"))
-                    resolved = await client.resolve_peer(chat.id)
-                    return resolved, normalized
-                except ValueError as exc:
+                    chat = await client.get_chat(chat_ref)
+                except (PeerIdInvalid, UsernameNotOccupied, UsernameInvalid, ValueError) as exc:
+                    logging.warning(
+                        "Peer lookup failed for message link target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    hint = "Join the channel first or provide a valid invite link for private chats."
+                    raise PeerIdInvalid(hint) from exc
+                except RPCError as exc:
+                    logging.warning(
+                        "RPC error resolving chat for message link target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    raise PeerIdInvalid("Cannot access the chat referenced by this link.") from exc
+
+                try:
+                    await client.get_messages(chat.id, message_id)
+                except (PeerIdInvalid, ValueError) as exc:
                     logging.warning(
                         "ValueError resolving message link target '%s' (normalized '%s', invite_link=%s): %s",
                         target,
@@ -218,7 +249,20 @@ async def resolve_target_peer(client: Client, target: str, invite_link: str | No
                         bool(invite_link),
                         exc,
                     )
-                    raise PeerIdInvalid(f"Invalid message link target: {exc}") from exc
+                    hint = "Ensure the bot/user session is a member and the message still exists."
+                    raise PeerIdInvalid(hint) from exc
+                except RPCError as exc:
+                    logging.warning(
+                        "RPC error fetching message for target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    raise PeerIdInvalid("Unable to fetch the message for this link.") from exc
+
+                resolved = await client.resolve_peer(chat.id)
+                return resolved, normalized
 
             if details.get("type") == "story":
                 try:
