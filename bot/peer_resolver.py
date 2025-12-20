@@ -22,7 +22,13 @@ if TYPE_CHECKING:  # pragma: no cover - imported lazily by workers
 
 @dataclass(frozen=True)
 class NormalizedTarget:
-    """Lightweight representation of a Telegram target extracted from a URL."""
+    """Lightweight representation of a Telegram target extracted from a URL.
+
+    ``kind`` captures the intent (``"username"``, ``"message"`` or ``"invite"``)
+    so callers can decide whether to proceed. Unsupported kinds are still
+    returned but marked ``supported=False`` so the worker can skip them
+    gracefully instead of raising in a tight loop.
+    """
 
     raw: str
     username: str | None
@@ -52,12 +58,24 @@ def _clean_failure_cache() -> None:
         _failure_cache.pop(key, None)
 
 
-def normalize_telegram_target(url: str) -> NormalizedTarget:
-    """Parse Telegram URLs into a normalized target.
+def _cache_permanent_failure(username: str | None, reason: str) -> None:
+    if not username:
+        return
 
-    Supports usernames (t.me/<username>), public message links (t.me/<username>/<msg>),
-    join-chat links (t.me/+<code> or t.me/joinchat/<code>) and ignores unsupported
-    formats by marking them as ``supported=False`` so the worker can skip them.
+    _failure_cache[username.lower()] = FailureRecord(
+        reason=reason,
+        expires_at=datetime.now(timezone.utc) + _FAILURE_TTL,
+    )
+
+
+def normalize_telegram_target(url: str) -> NormalizedTarget:
+    """Parse Telegram URLs/usernames into a normalized target.
+
+    The function accepts bare usernames (``foo`` or ``@foo``), public profile
+    links (``https://t.me/foo``), message links (``https://t.me/foo/123``), and
+    invite links (``https://t.me/+abc`` or ``https://t.me/joinchat/abc``). Invite
+    links are returned as ``supported=False`` because reporting requires a
+    resolvable username/peer.
     """
 
     from urllib.parse import urlparse
@@ -65,11 +83,11 @@ def normalize_telegram_target(url: str) -> NormalizedTarget:
     raw = url.strip()
     parsed = urlparse(raw if raw.startswith("http") else f"https://{raw}")
     path_parts = [part for part in parsed.path.split("/") if part]
+    netloc = parsed.netloc.lower()
 
-    if not parsed.netloc.endswith("t.me") or not path_parts:
-        # Treat plain usernames as a username target
-        username = raw.lstrip("@")
-        return NormalizedTarget(raw=raw, username=username or None, kind="username")
+    if not netloc.endswith("t.me") or not path_parts:
+        username = raw.lstrip("@") or None
+        return NormalizedTarget(raw=raw, username=username, kind="username")
 
     # Join-chat/invite links
     if path_parts[0].startswith("+"):
@@ -78,7 +96,7 @@ def normalize_telegram_target(url: str) -> NormalizedTarget:
     if path_parts[0].lower() == "joinchat" and len(path_parts) >= 2:
         return NormalizedTarget(raw=raw, username=None, kind="invite", invite=path_parts[1], supported=False)
 
-    # Message links – we only care about the username for reporting
+    # Message links – we care about the username for reporting, not the message id
     if len(path_parts) >= 2 and path_parts[1].isdigit():
         return NormalizedTarget(
             raw=raw,
@@ -158,11 +176,7 @@ async def resolve_chat(
 
             if isinstance(exc, (PeerIdInvalid, UsernameNotOccupied, UsernameInvalid, ChannelPrivate)):
                 last_reason = exc.__class__.__name__
-                if cache_key:
-                    _failure_cache[cache_key] = FailureRecord(
-                        reason=last_reason,
-                        expires_at=datetime.now(timezone.utc) + _FAILURE_TTL,
-                    )
+                _cache_permanent_failure(cache_key or target.username, last_reason)
                 logging.warning(
                     "Permanent peer failure for %s via %s: %s",
                     target.raw,
@@ -173,28 +187,33 @@ async def resolve_chat(
 
             if isinstance(exc, BadRequest):
                 last_reason = exc.__class__.__name__
-                if cache_key:
-                    _failure_cache[cache_key] = FailureRecord(
-                        reason=last_reason,
-                        expires_at=datetime.now(timezone.utc) + _FAILURE_TTL,
-                    )
+                _cache_permanent_failure(cache_key or target.username, last_reason)
                 logging.warning("Bad request resolving %s: %s", target.raw, exc)
                 return None
 
-            # Transient RPC/network errors
-            backoff = min(max_delay, base_delay * (2 ** (attempts - 1)))
-            jitter = random.uniform(0, backoff / 2)
-            delay = backoff + jitter
+            if isinstance(exc, RPCError):
+                backoff = min(max_delay, base_delay * (2 ** (attempts - 1)))
+                jitter = random.uniform(0, backoff / 2)
+                delay = backoff + jitter
+                logging.warning(
+                    "Transient resolution failure for %s via %s (attempt %s/%s): %s; retrying in %.1fs",
+                    target.raw,
+                    getattr(client, "name", "client"),
+                    attempts,
+                    max_attempts,
+                    exc.__class__.__name__,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # Network/Value errors are treated as permanent to avoid log spam
+            last_reason = exc.__class__.__name__
+            _cache_permanent_failure(cache_key or target.username, last_reason)
             logging.warning(
-                "Transient resolution failure for %s via %s (attempt %s/%s): %s; retrying in %.1fs",
-                target.raw,
-                getattr(client, "name", "client"),
-                attempts,
-                max_attempts,
-                exc.__class__.__name__,
-                delay,
+                "Unrecoverable error resolving %s via %s: %s", target.raw, getattr(client, "name", "client"), exc
             )
-            await asyncio.sleep(delay)
+            return None
 
     if cache_key and last_reason:
         _failure_cache[cache_key] = FailureRecord(

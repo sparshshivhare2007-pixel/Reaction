@@ -253,6 +253,8 @@ async def perform_reporting(
 
     try:
         normalized_target = normalize_telegram_target(target)
+        # ``report_target`` uses a TTL cache for permanent failures so repeated
+        # jobs do not hammer invalid/private peers or spam logs with PeerIdInvalid.
         chat_id, normalized_target = await report_target(clients, target, invite_link=invite_link)
         normalized_label = normalized_target.username or normalized_target.raw
 
