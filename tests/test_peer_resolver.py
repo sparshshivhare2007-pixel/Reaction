@@ -1,6 +1,6 @@
 import unittest
 
-from bot.peer_resolver import NormalizedTarget, normalize_telegram_target
+from bot.peer_resolver import NormalizedPeerInput, NormalizedTarget, normalize_input, normalize_telegram_target
 
 
 class NormalizeTelegramTargetTest(unittest.TestCase):
@@ -67,6 +67,65 @@ class NormalizeTelegramTargetTest(unittest.TestCase):
                 self.assertIsNone(normalized.username)
                 self.assertFalse(normalized.supported)
                 self.assertEqual(normalized.kind, "invite")
+
+
+class NormalizeInputTest(unittest.TestCase):
+    def test_username_and_numeric_inputs(self) -> None:
+        cases: list[tuple[str, NormalizedPeerInput]] = [
+            (
+                "  @UserName  ",
+                NormalizedPeerInput(
+                    raw="@UserName",
+                    normalized="UserName",
+                    kind="username",
+                    username="UserName",
+                    numeric_id=None,
+                    invite=None,
+                ),
+            ),
+            (
+                "https://t.me/Example",
+                NormalizedPeerInput(
+                    raw="https://t.me/Example",
+                    normalized="Example",
+                    kind="username",
+                    username="Example",
+                    numeric_id=None,
+                    invite=None,
+                ),
+            ),
+            (
+                "-1001234567890",
+                NormalizedPeerInput(
+                    raw="-1001234567890",
+                    normalized="-1001234567890",
+                    kind="numeric",
+                    username=None,
+                    numeric_id=-1001234567890,
+                    invite=None,
+                ),
+            ),
+            (
+                "t.me/+abcdef",
+                NormalizedPeerInput(
+                    raw="t.me/+abcdef",
+                    normalized="+abcdef",
+                    kind="invite",
+                    username=None,
+                    numeric_id=None,
+                    invite="+abcdef",
+                ),
+            ),
+        ]
+
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                normalized = normalize_input(raw)
+                self.assertEqual(normalized.normalized, expected.normalized)
+                self.assertEqual(normalized.kind, expected.kind)
+                self.assertEqual(normalized.username, expected.username)
+                self.assertEqual(normalized.numeric_id, expected.numeric_id)
+                self.assertEqual(normalized.invite, expected.invite)
 
 
 if __name__ == "__main__":
