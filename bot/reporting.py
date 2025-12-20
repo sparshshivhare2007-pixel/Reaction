@@ -14,7 +14,7 @@ from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
 from bot.ui import render_card, report_again_keyboard
-from bot.peer_resolver import normalize_telegram_target, report_target
+from bot.peer_resolver import normalize_input, report_target
 from bot.utils import validate_sessions
 from report import report_profile_photo
 
@@ -252,11 +252,11 @@ async def perform_reporting(
     reason_text = "; ".join(reasons)[:512] or "No reason provided"
 
     try:
-        normalized_target = normalize_telegram_target(target)
+        normalized_target = normalize_input(target)
         # ``report_target`` uses a TTL cache for permanent failures so repeated
         # jobs do not hammer invalid/private peers or spam logs with PeerIdInvalid.
         chat_id, normalized_target = await report_target(clients, target, invite_link=invite_link)
-        normalized_label = normalized_target.username or normalized_target.raw
+        normalized_label = normalized_target.username or normalized_target.normalized or normalized_target.raw
 
         if chat_id is None:
             return {
