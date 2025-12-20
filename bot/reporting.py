@@ -14,12 +14,7 @@ from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
 from bot.ui import render_card, report_again_keyboard
-from bot.target_resolver import (
-    ensure_join_if_needed,
-    fetch_target_details,
-    parse_target,
-    resolve_peer,
-)
+from bot.target_resolver import ensure_join_if_needed, fetch_target_details, parse_target, resolve_entity
 from bot.utils import validate_sessions
 from report import report_profile_photo
 
@@ -288,7 +283,7 @@ async def perform_reporting(
                     "Join attempt failed for %s via %s: %s", target, client.name, join_result.reason or join_result.error
                 )
 
-            resolution = await resolve_peer(client, target_spec)
+            resolution = await resolve_entity(client, target_spec)
             details = await fetch_target_details(client, resolution)
             logging.info(
                 "TargetResolver: parsed=%s joined=%s resolved=%s title=%s members=%s",

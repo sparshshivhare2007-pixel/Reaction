@@ -83,6 +83,14 @@ def report_again_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def navigation_keyboard(*, show_back: bool = True) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if show_back:
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="nav:back")])
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="nav:cancel")])
+    return add_restart_button(InlineKeyboardMarkup(rows))
+
+
 def main_menu_keyboard(
     saved_sessions: int = 0,
     active_sessions: int = 0,
@@ -168,4 +176,5 @@ __all__ = [
     "render_card",
     "add_restart_button",
     "report_again_keyboard",
+    "navigation_keyboard",
 ]

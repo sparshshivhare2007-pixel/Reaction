@@ -36,6 +36,7 @@ from bot.constants import (
     TARGET_KIND,
 )
 from bot.dependencies import API_HASH, API_ID, data_store
+from bot.target_resolver import ensure_join_if_needed, fetch_target_details, parse_target, resolve_entity
 from bot.health import format_duration, process_health
 from bot.scheduler import SchedulerManager
 from bot.reporting import run_report_job
@@ -56,6 +57,7 @@ from bot.ui import (
     render_greeting,
     session_mode_keyboard,
     target_kind_keyboard,
+    navigation_keyboard,
 )
 from bot.utils import (
     friendly_error,
@@ -191,6 +193,132 @@ async def _validate_sessions_with_feedback(
         return []
 
     return valid
+
+
+async def _with_resolver_client(context: ContextTypes.DEFAULT_TYPE, callback):
+    """Start a lightweight Pyrogram client for target resolution and cleanup automatically."""
+
+    from pyrogram import Client
+
+    flow = flow_state(context)
+    profile = profile_state(context)
+
+    api_id = flow.get("api_id") or profile.get("api_id") or config.API_ID
+    api_hash = flow.get("api_hash") or profile.get("api_hash") or config.API_HASH
+    sessions = flow.get("sessions") or []
+
+    if not api_id or not api_hash or not sessions:
+        raise RuntimeError("Missing API credentials or sessions for resolution")
+
+    session = sessions[0]
+    client = Client(
+        name=f"resolver_{abs(hash(session)) % 10_000}",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=session,
+        workdir=f"/tmp/resolver_{abs(hash(session)) % 10_000}",
+    )
+    try:
+        await client.start()
+        return await callback(client)
+    finally:
+        try:
+            await client.stop()
+        except Exception:
+            pass
+
+
+def _attach_invite(spec, invite_link: str | None):
+    if not invite_link or spec.invite_link:
+        return spec
+
+    invite_hash_match = None
+    if "+" in invite_link:
+        invite_hash_match = invite_link.split("+")[-1]
+    else:
+        invite_hash_match = invite_link.rsplit("/", 1)[-1]
+
+    return spec.__class__(
+        raw=spec.raw,
+        normalized=spec.normalized,
+        kind="invite" if spec.kind == "username" else spec.kind,
+        username=spec.username,
+        numeric_id=spec.numeric_id,
+        invite_hash=invite_hash_match,
+        invite_link=invite_link,
+        message_id=spec.message_id,
+        internal_id=spec.internal_id,
+    )
+
+
+def _format_target_details(details) -> str:
+    lines = ["🎯 <b>Target Details</b>"]
+    if details.title:
+        lines.append(f"Name: {escape(details.title)}")
+    if details.username:
+        lines.append(f"Username: @{escape(details.username)}")
+    if details.id:
+        lines.append(f"ID: <code>{details.id}</code>")
+    if details.type:
+        lines.append(f"Type: {escape(details.type)}{' (private)' if details.private else ''}")
+    if details.members:
+        lines.append(f"Members/Subscribers: {details.members}")
+    if details.description:
+        lines.append(f"About: {escape(details.description[:140])}")
+    flags = []
+    for flag, label in (
+        (details.is_bot, "bot"),
+        (details.is_verified, "verified"),
+        (details.is_scam, "scam"),
+        (details.is_fake, "fake"),
+    ):
+        if flag:
+            flags.append(label)
+    if flags:
+        lines.append(f"Flags: {', '.join(flags)}")
+    return "\n".join(lines)
+
+
+async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFAULT_TYPE, target_text: str) -> bool:
+    """Join private chats when needed and show target details."""
+
+    invite_link = flow_state(context).get("invite_link")
+    spec = _attach_invite(parse_target(target_text), invite_link)
+
+    async def _runner(client):
+        join_info = await ensure_join_if_needed(client, spec)
+        resolution = await resolve_entity(client, spec)
+        details = await fetch_target_details(client, resolution)
+        return join_info, resolution, details
+
+    try:
+        join_info, resolution, details = await _with_resolver_client(context, _runner)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Target preview failed")
+        await update.effective_message.reply_text(
+            friendly_error("Unable to reach this target right now. Please verify the link and try again."),
+            reply_markup=navigation_keyboard(),
+        )
+        return False
+
+    if join_info and not join_info.ok:
+        await update.effective_message.reply_text(
+            friendly_error("I could not join the invite link. Please provide a valid invite or try another session."),
+            reply_markup=navigation_keyboard(),
+        )
+        return False
+
+    if not resolution.ok:
+        await update.effective_message.reply_text(
+            friendly_error("Could not resolve that target. Ensure I have access and the link is correct."),
+            reply_markup=navigation_keyboard(),
+        )
+        return False
+
+    await update.effective_message.reply_text(
+        _format_target_details(details), parse_mode=ParseMode.HTML, reply_markup=navigation_keyboard(show_back=False)
+    )
+    return True
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -345,6 +473,25 @@ async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=main_menu_keyboard(saved, active),
         )
         return ConversationHandler.END
+    return ConversationHandler.END
+
+
+async def handle_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "nav:back":
+        await safe_edit_message(query, "What are you reporting?", reply_markup=target_kind_keyboard())
+        return TARGET_KIND
+
+    reset_user_context(context, update.effective_user.id if update.effective_user else None)
+    profile = profile_state(context)
+    profile["saved_sessions"] = await data_store.get_sessions()
+    await safe_edit_message(
+        query,
+        "Canceled. Use /report to start again.",
+        reply_markup=main_menu_keyboard(len(profile.get("saved_sessions", [])), active_session_count(context)),
+    )
     return ConversationHandler.END
 
 
@@ -585,14 +732,22 @@ async def handle_target_kind(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     if query.data == "kind:private":
-        await safe_edit_message(query, "Send the private invite link (https://t.me/+code)")
+        await safe_edit_message(
+            query,
+            "Send the private invite link (https://t.me/+code)",
+            reply_markup=navigation_keyboard(show_back=False),
+        )
         return PRIVATE_INVITE
 
     if query.data == "kind:public":
-        await safe_edit_message(query, "Send the public message link (https://t.me/username/1234)")
+        await safe_edit_message(
+            query,
+            "Send the public message link (https://t.me/username/1234)",
+            reply_markup=navigation_keyboard(show_back=False),
+        )
         return PUBLIC_MESSAGE
 
-    await safe_edit_message(query, "Send the story URL or username.")
+    await safe_edit_message(query, "Send the story URL or username.", reply_markup=navigation_keyboard(show_back=False))
     return STORY_URL
 
 
@@ -601,15 +756,45 @@ async def handle_private_invite(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         parsed = parse_telegram_url(text)
     except Exception:
-        await update.effective_message.reply_text("Please send a valid private invite link (https://t.me/+code)")
+        await update.effective_message.reply_text(
+            "Please send a valid private invite link (https://t.me/+code)", reply_markup=navigation_keyboard()
+        )
         return PRIVATE_INVITE
 
     if parsed.get("type") != "invite":
-        await update.effective_message.reply_text("Please send a valid private invite link (https://t.me/+code)")
+        await update.effective_message.reply_text(
+            "Please send a valid private invite link (https://t.me/+code)", reply_markup=navigation_keyboard()
+        )
         return PRIVATE_INVITE
 
     flow_state(context)["invite_link"] = parsed.get("invite_link")
-    await update.effective_message.reply_text("Now send the private message link (https://t.me/c/123456789/45)")
+
+    invite_preview = parse_target(text)
+
+    async def _runner(client):
+        return await ensure_join_if_needed(client, invite_preview)
+
+    try:
+        join_result = await _with_resolver_client(context, _runner)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Failed to join invite during private flow")
+        await update.effective_message.reply_text(
+            friendly_error("Unable to join this invite with the provided session."),
+            reply_markup=navigation_keyboard(),
+        )
+        return PRIVATE_INVITE
+
+    if not join_result.ok:
+        await update.effective_message.reply_text(
+            friendly_error("Join failed. Please verify the invite link or try another session."),
+            reply_markup=navigation_keyboard(),
+        )
+        return PRIVATE_INVITE
+
+    await update.effective_message.reply_text(
+        "Joined successfully. Now send the private message link (https://t.me/c/123456789/45)",
+        reply_markup=navigation_keyboard(),
+    )
     return PRIVATE_MESSAGE
 
 
@@ -618,16 +803,25 @@ async def handle_private_message_link(update: Update, context: ContextTypes.DEFA
     try:
         parsed = parse_telegram_url(text)
     except Exception:
-        await update.effective_message.reply_text("Please send a valid private message link (https://t.me/c/123456789/45)")
+        await update.effective_message.reply_text(
+            "Please send a valid private message link (https://t.me/c/123456789/45)",
+            reply_markup=navigation_keyboard(),
+        )
         return PRIVATE_MESSAGE
 
     if parsed.get("type") != "private_message":
-        await update.effective_message.reply_text("Please send a valid private message link (https://t.me/c/123456789/45)")
+        await update.effective_message.reply_text(
+            "Please send a valid private message link (https://t.me/c/123456789/45)",
+            reply_markup=navigation_keyboard(),
+        )
         return PRIVATE_MESSAGE
 
     flow = flow_state(context)
     flow["targets"] = [text]
     flow["target_kind"] = "private"
+
+    if not await _resolve_and_preview_target(update, context, text):
+        return PRIVATE_MESSAGE
 
     await update.effective_message.reply_text(
         REASON_PROMPT, reply_markup=reason_keyboard()
@@ -637,13 +831,18 @@ async def handle_private_message_link(update: Update, context: ContextTypes.DEFA
 
 async def handle_public_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
-    if not is_valid_link(text):
-        await update.effective_message.reply_text("Send a valid public message link (https://t.me/username/1234)")
+    if not text:
+        await update.effective_message.reply_text(
+            "Send a valid public link or @username (https://t.me/username/1234)", reply_markup=navigation_keyboard()
+        )
         return PUBLIC_MESSAGE
 
     flow = flow_state(context)
     flow["targets"] = [text]
     flow["target_kind"] = "public"
+
+    if not await _resolve_and_preview_target(update, context, text):
+        return PUBLIC_MESSAGE
 
     await update.effective_message.reply_text(
         REASON_PROMPT, reply_markup=reason_keyboard()
@@ -653,13 +852,18 @@ async def handle_public_message_link(update: Update, context: ContextTypes.DEFAU
 
 async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
-    if not is_valid_link(text):
-        await update.effective_message.reply_text("Send a valid story URL or username.")
+    if not text:
+        await update.effective_message.reply_text(
+            "Send a valid story URL or username.", reply_markup=navigation_keyboard()
+        )
         return STORY_URL
 
     flow = flow_state(context)
     flow["targets"] = [text]
     flow["target_kind"] = "story"
+
+    if not await _resolve_and_preview_target(update, context, text):
+        return STORY_URL
 
     await update.effective_message.reply_text(
         REASON_PROMPT, reply_markup=reason_keyboard()
@@ -825,6 +1029,7 @@ __all__ = [
     "handle_api_hash",
     "handle_sessions",
     "handle_target_kind",
+    "handle_navigation",
     "handle_private_invite",
     "handle_private_message_link",
     "handle_public_message_link",

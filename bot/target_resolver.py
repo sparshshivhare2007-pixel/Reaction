@@ -53,6 +53,11 @@ class TargetDetails:
     username: str | None
     members: int | None
     private: bool
+    description: str | None = None
+    is_bot: bool | None = None
+    is_verified: bool | None = None
+    is_scam: bool | None = None
+    is_fake: bool | None = None
 
 
 _CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
@@ -164,10 +169,20 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
     invite_link = target_spec.invite_link or f"https://t.me/+{target_spec.invite_hash}"
     try:
         await client.join_chat(invite_link)
-        logging.info("Joined invite link %s via %s", invite_link, getattr(client, "name", "client"))
+        logging.info(
+            "TargetResolver: joined invite",
+            extra={
+                "invite_link": invite_link,
+                "session_name": getattr(client, "name", "client"),
+                "step": "ensure_join",
+            },
+        )
         return JoinResult(ok=True, joined=True)
     except UserAlreadyParticipant:
-        logging.info("Already a participant for %s via %s", invite_link, getattr(client, "name", "client"))
+        logging.info(
+            "TargetResolver: already participant",
+            extra={"invite_link": invite_link, "session_name": getattr(client, "name", "client"), "step": "ensure_join"},
+        )
         return JoinResult(ok=True, joined=False, reason="already_participant")
     except FloodWait as fw:
         wait_seconds = min(getattr(fw, "value", 1), 60)
@@ -183,8 +198,22 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
     except ChatAdminRequired as exc:
         return JoinResult(ok=False, joined=False, reason="admin_required", error=str(exc))
     except Exception as exc:  # noqa: BLE001
-        logging.exception("Unexpected failure joining %s via %s", invite_link, getattr(client, "name", "client"))
+        logging.exception(
+            "TargetResolver: unexpected join failure",
+            extra={
+                "invite_link": invite_link,
+                "session_name": getattr(client, "name", "client"),
+                "step": "ensure_join",
+                "error": exc.__class__.__name__,
+            },
+        )
         return JoinResult(ok=False, joined=False, reason="join_failed", error=str(exc))
+
+
+async def ensure_joined(client: Any, target_spec: TargetSpec) -> JoinResult:
+    """Wrapper to keep a stable public helper name."""
+
+    return await ensure_join_if_needed(client, target_spec)
 
 
 async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: int = 3) -> ResolvedTarget:
@@ -252,6 +281,40 @@ async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: in
     return ResolvedTarget(ok=False, peer=None, chat_id=None, method=None, error=last_error)
 
 
+async def resolve_entity(client: Any, target_spec: TargetSpec, *, max_attempts: int = 3) -> ResolvedTarget:
+    """Resolve a target into a peer, retrying after a join when needed."""
+
+    # Join first for private targets to avoid PeerIdInvalid on lookups.
+    join_result = None
+    if target_spec.requires_join:
+        join_result = await ensure_join_if_needed(client, target_spec)
+        if not join_result.ok:
+            return ResolvedTarget(ok=False, peer=None, chat_id=None, method="ensure_join", error=join_result.reason)
+
+    resolved = await resolve_peer(client, target_spec, max_attempts=max_attempts)
+    if resolved.ok:
+        return resolved
+
+    if resolved.error in {"PeerIdInvalid", "ChannelPrivate", "ChatIdInvalid", "ChannelInvalid"} and target_spec.requires_join:
+        retry_join = await ensure_join_if_needed(client, target_spec)
+        if retry_join.ok:
+            resolved = await resolve_peer(client, target_spec, max_attempts=max_attempts)
+            if resolved.ok:
+                return resolved
+
+    logging.warning(
+        "TargetResolver: failed resolution",
+        extra={
+            "target": target_spec.raw,
+            "kind": target_spec.kind,
+            "error": resolved.error,
+            "joined": join_result.reason if join_result else None,
+            "session_name": getattr(client, "name", "client"),
+        },
+    )
+    return resolved
+
+
 def _chat_id_from_chat(chat: Any) -> int:
     if hasattr(chat, "id"):
         return int(getattr(chat, "id"))
@@ -278,8 +341,13 @@ async def fetch_target_details(client: Any, resolved: ResolvedTarget) -> TargetD
     peer_type = getattr(chat, "type", None)
     title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
     username = getattr(chat, "username", None)
-    members = getattr(chat, "members_count", None)
+    members = getattr(chat, "members_count", None) or getattr(chat, "participants_count", None)
     private = bool(getattr(chat, "is_private", False) or (username is None))
+    description = getattr(chat, "description", None) or getattr(chat, "bio", None)
+    is_bot = getattr(chat, "is_bot", None)
+    is_verified = getattr(chat, "is_verified", None)
+    is_scam = getattr(chat, "is_scam", None)
+    is_fake = getattr(chat, "is_fake", None)
 
     return TargetDetails(
         type=str(peer_type) if peer_type else None,
@@ -288,6 +356,11 @@ async def fetch_target_details(client: Any, resolved: ResolvedTarget) -> TargetD
         username=username,
         members=members,
         private=private,
+        description=description,
+        is_bot=is_bot,
+        is_verified=is_verified,
+        is_scam=is_scam,
+        is_fake=is_fake,
     )
 
 
@@ -344,7 +417,9 @@ __all__ = [
     "TargetDetails",
     "parse_target",
     "ensure_join_if_needed",
+    "ensure_joined",
     "resolve_peer",
+    "resolve_entity",
     "fetch_target_details",
     "debug_resolve_targets",
 ]
