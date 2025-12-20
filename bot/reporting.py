@@ -14,7 +14,8 @@ from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
 from bot.ui import render_card, report_again_keyboard
-from bot.utils import normalize_target, resolve_target_peer, validate_sessions
+from bot.peer_resolver import normalize_telegram_target, report_target
+from bot.utils import validate_sessions
 from report import report_profile_photo
 
 if TYPE_CHECKING:
@@ -251,59 +252,16 @@ async def perform_reporting(
     reason_text = "; ".join(reasons)[:512] or "No reason provided"
 
     try:
-        chat_id: int | None = None
-        normalized_target: str | None = normalize_target(target)[0]
-        last_error: str | None = None
-
-        for client in clients:
-            try:
-                peer, normalized = await resolve_target_peer(client, target, invite_link)
-                normalized_target = normalized
-                chat_id = peer
-                break
-            except (PeerIdInvalid, UsernameInvalid, UsernameNotOccupied) as exc:
-                logging.warning(
-                    "Peer resolution failed for '%s' (normalized '%s') via %s: %s",
-                    target,
-                    normalized_target or target,
-                    client.name,
-                    exc.__class__.__name__,
-                )
-                last_error = (
-                    "Cannot report this user yet. Ask the user to send/forward a message "
-                    "from that account to the bot/client or interact once so Telegram knows the peer."
-                )
-                continue
-            except BadRequest as exc:
-                logging.warning(
-                    "Bad request resolving '%s' (normalized '%s') via %s: %s",
-                    target,
-                    normalized_target or target,
-                    client.name,
-                    exc.__class__.__name__,
-                )
-                last_error = f"The link '{target}' is not valid: {exc}."
-                break
-            except RPCError as exc:
-                logging.warning(
-                    "RPC error resolving '%s' (normalized '%s') via %s: %s",
-                    target,
-                    normalized_target or target,
-                    client.name,
-                    exc.__class__.__name__,
-                )
-                last_error = (
-                    "Cannot report this user yet. Ask the user to send/forward a message from that "
-                    "account to the bot/client or interact once so Telegram knows the peer."
-                )
-                continue
+        normalized_target = normalize_telegram_target(target)
+        chat_id, normalized_target = await report_target(clients, target, invite_link=invite_link)
+        normalized_label = normalized_target.username or normalized_target.raw
 
         if chat_id is None:
             return {
                 "success": 0,
                 "failed": 0,
                 "halted": False,
-                "error": last_error or "Unable to resolve the target with the available sessions.",
+                "error": "Unable to resolve the target with the available sessions (likely invalid/private).",
             }
 
         if invite_link:
@@ -352,7 +310,7 @@ async def perform_reporting(
                 logging.error(
                     "Peer not resolvable while reporting %s (normalized %s) via %s: %s",
                     target,
-                    normalized_target,
+                    normalized_label,
                     client.name,
                     exc.__class__.__name__,
                 )
