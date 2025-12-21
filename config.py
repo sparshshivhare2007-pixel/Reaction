@@ -13,7 +13,7 @@ from typing import Final
 #  🔴 FILL THESE VALUES CAREFULLY BEFORE DEPLOYMENT
 # -----------------------------------------------------------
 
-BOT_TOKEN: Final[str] = "8549633097:AAGeb2iAfIHCiSQJn5uKUqN8IHr7vztl6bU"
+BOT_TOKEN: Final[str] = "8449133505:AAFS4CP6gKpsveQefRp1LPilfkVL6FEYiuA"
 
 API_ID: Final[int] = 27989579        # ← Enter your API ID (integer)
 API_HASH: Final[str] = "64742ebe270a7d202150134d66397839"
