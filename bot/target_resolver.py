@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
+from bot.link_parser import maybe_parse_message_link
+
 
 @dataclass(frozen=True)
 class TargetSpec:
@@ -25,7 +27,7 @@ class TargetSpec:
 
     @property
     def requires_join(self) -> bool:
-        return self.kind == "invite" or bool(self.invite_hash)
+        return self.kind == "invite" or bool(self.invite_hash or self.invite_link)
 
 
 @dataclass
@@ -60,6 +62,9 @@ class TargetDetails:
     is_fake: bool | None = None
 
 
+_TRAILING_PUNCTUATION = ",.;)]}>'\""
+
+
 _CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
 _CACHE_TTL = timedelta(minutes=10)
 _FAILURE_CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
@@ -82,6 +87,11 @@ def _strip_query(url: str) -> str:
     return f"{prefix}{path}" if prefix else path
 
 
+def _clean_target(raw: str) -> str:
+    cleaned = (raw or "").strip()
+    return cleaned.rstrip(_TRAILING_PUNCTUATION)
+
+
 def parse_target(raw_input: str) -> TargetSpec:
     """Normalize user-provided Telegram targets.
 
@@ -90,11 +100,29 @@ def parse_target(raw_input: str) -> TargetSpec:
     as a username. Query parameters and trailing slashes are stripped.
     """
 
-    raw = (raw_input or "").strip()
+    raw = _clean_target(raw_input)
     if not raw:
         raise ValueError("Target is empty; provide a username, invite link, or numeric ID.")
 
     cleaned = _strip_query(raw)
+
+    message_link = maybe_parse_message_link(cleaned)
+    if message_link:
+        if message_link.is_private:
+            return TargetSpec(
+                raw=raw_input,
+                normalized=f"c/{message_link.internal_id}",
+                kind="internal_message",
+                internal_id=message_link.internal_id,
+                message_id=message_link.message_id,
+            )
+        return TargetSpec(
+            raw=raw_input,
+            normalized=message_link.username or cleaned,
+            kind="message",
+            username=message_link.username,
+            message_id=message_link.message_id,
+        )
 
     # Numeric IDs (-100..., user id, etc.)
     numeric_candidate = raw.replace(" ", "")
