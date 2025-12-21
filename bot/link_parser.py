@@ -16,6 +16,17 @@ class ParsedTelegramLink:
     username: str | None = None
 
 
+@dataclass(frozen=True)
+class ParsedMessageLink:
+    raw: str
+    normalized_url: str
+    chat_ref: str | int
+    message_id: int
+    is_private: bool
+    username: str | None = None
+    internal_id: int | None = None
+
+
 _TRAILING_PUNCTUATION = ",.;)]}>'\""
 
 
@@ -23,6 +34,12 @@ def _clean_input(text: str) -> str:
     cleaned = (text or "").strip()
     cleaned = cleaned.rstrip(_TRAILING_PUNCTUATION)
     return cleaned
+
+
+def _ensure_scheme(text: str) -> str:
+    if text.startswith("http") or text.startswith("tg"):
+        return text
+    return f"https://{text}"
 
 
 def _parse_invite_hash_from_url(parsed) -> str | None:
@@ -78,7 +95,7 @@ def parse_join_target(raw: str) -> ParsedTelegramLink:
             username=username,
         )
 
-    parsed = urlparse(cleaned if cleaned.startswith("http") or cleaned.startswith("tg") else f"https://{cleaned}")
+    parsed = urlparse(_ensure_scheme(cleaned))
     invite_hash = _parse_invite_hash_from_url(parsed)
     if invite_hash:
         return ParsedTelegramLink(
@@ -112,6 +129,72 @@ def parse_join_target(raw: str) -> ParsedTelegramLink:
     raise ValueError("Unsupported link or username")
 
 
+def parse_message_link(raw: str) -> ParsedMessageLink:
+    """Parse a Telegram message link into chat/message identifiers.
+
+    Supports public (``https://t.me/<username>/<msg_id>``) and private
+    (``https://t.me/c/<internal_id>/<msg_id>``) message links, with or without
+    schemes or trailing query strings.
+    """
+
+    cleaned = _clean_input(raw)
+    if not cleaned:
+        raise ValueError("Empty link")
+
+    parsed = urlparse(_ensure_scheme(cleaned))
+    if not parsed.netloc or not parsed.netloc.endswith("t.me"):
+        raise ValueError("Not a Telegram link")
+
+    path_parts = [p for p in parsed.path.split("/") if p]
+    if len(path_parts) < 2:
+        raise ValueError("Message link missing components")
+
+    def _extract_message_id(raw_part: str) -> int:
+        digits = "".join(ch for ch in raw_part if ch.isdigit())
+        if not digits:
+            raise ValueError("Message id is missing")
+        return int(digits)
+
+    if path_parts[0].lower() == "c":
+        if len(path_parts) < 3:
+            raise ValueError("Private message link is incomplete")
+        internal_id_part = path_parts[1]
+        if not internal_id_part.isdigit():
+            raise ValueError("Private link has non-numeric chat id")
+        internal_id = int(internal_id_part)
+        message_id = _extract_message_id(path_parts[2])
+        normalized = f"https://t.me/c/{internal_id}/{message_id}"
+        return ParsedMessageLink(
+            raw=raw,
+            normalized_url=normalized,
+            chat_ref=int(f"-100{internal_id}"),
+            message_id=message_id,
+            is_private=True,
+            internal_id=internal_id,
+        )
+
+    username = path_parts[0].lstrip("@")
+    if not username:
+        raise ValueError("Username missing from message link")
+    message_id = _extract_message_id(path_parts[1])
+    normalized = f"https://t.me/{username}/{message_id}"
+    return ParsedMessageLink(
+        raw=raw,
+        normalized_url=normalized,
+        chat_ref=username,
+        message_id=message_id,
+        is_private=False,
+        username=username,
+    )
+
+
+def maybe_parse_message_link(raw: str) -> ParsedMessageLink | None:
+    try:
+        return parse_message_link(raw)
+    except Exception:
+        return None
+
+
 def maybe_parse_join_target(raw: str) -> ParsedTelegramLink | None:
     try:
         return parse_join_target(raw)
@@ -119,4 +202,11 @@ def maybe_parse_join_target(raw: str) -> ParsedTelegramLink | None:
         return None
 
 
-__all__ = ["ParsedTelegramLink", "parse_join_target", "maybe_parse_join_target"]
+__all__ = [
+    "ParsedTelegramLink",
+    "ParsedMessageLink",
+    "parse_join_target",
+    "maybe_parse_join_target",
+    "parse_message_link",
+    "maybe_parse_message_link",
+]

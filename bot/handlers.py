@@ -39,7 +39,13 @@ from bot.constants import (
 )
 from bot.dependencies import API_HASH, API_ID, data_store
 from bot.link_parser import parse_join_target
-from bot.target_resolver import ensure_join_if_needed, fetch_target_details, parse_target, resolve_entity
+from bot.target_resolver import (
+    TargetDetails,
+    ensure_join_if_needed,
+    fetch_target_details,
+    parse_target,
+    resolve_entity,
+)
 from bot.health import format_duration, process_health
 from bot.scheduler import SchedulerManager
 from bot.reporting import run_report_job
@@ -381,16 +387,89 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
     """Join private chats when needed and show target details."""
 
     invite_link = flow_state(context).get("invite_link")
-    spec = _attach_invite(parse_target(target_text), invite_link)
+    try:
+        spec = _attach_invite(parse_target(target_text), invite_link)
+    except Exception:
+        await _notify_user(
+            update,
+            friendly_error("I could not understand this link. Please send a valid Telegram message link."),
+            reply_markup=navigation_keyboard(),
+        )
+        return False
+
+    status_message = await update.effective_message.reply_text(
+        "🔍 Resolving target…", reply_markup=navigation_keyboard()
+    )
+
+    async def _set_status(join: str | None = None, fetch: str | None = None, message: str | None = None, footer: str | None = None):
+        lines = ["<b>Target resolution</b>"]
+        if join:
+            lines.append(f"• {escape(join)}")
+        if fetch:
+            lines.append(f"• {escape(fetch)}")
+        if message:
+            lines.append(f"• {escape(message)}")
+        if footer:
+            lines.append(footer)
+        text = "\n".join(lines)
+        try:
+            await status_message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=navigation_keyboard())
+        except Exception:
+            logging.exception("Failed to update resolution status")
 
     async def _runner(client):
-        join_info = await ensure_join_if_needed(client, spec)
+        join_info = None
+        resolution = None
+        details = None
+        message_preview = None
+        await _set_status(
+            join="Joining chat…" if spec.requires_join else "Join step not required",
+            fetch="Resolving chat…",
+            message="Waiting for message…" if spec.message_id else None,
+        )
+        if spec.requires_join:
+            join_info = await ensure_join_if_needed(client, spec)
+            if not join_info.ok:
+                return {"join": join_info, "error": join_info.reason or join_info.error}
+            await _set_status(join="Joined chat", fetch="Resolving chat…")
+
         resolution = await resolve_entity(client, spec)
+        if not resolution.ok:
+            return {"join": join_info, "resolution": resolution, "error": resolution.error}
+
         details = await fetch_target_details(client, resolution)
-        return join_info, resolution, details
+        await _set_status(
+            join="Joined chat" if join_info else "Accessible", fetch="Chat resolved", message="Fetching message…" if spec.message_id else None
+        )
+
+        chat_ref = None
+        if spec.message_id:
+            try:
+                if spec.kind == "internal_message" and spec.internal_id:
+                    chat_ref = int(f"-100{spec.internal_id}")
+                elif resolution.chat_id:
+                    chat_ref = resolution.chat_id
+                elif spec.username:
+                    chat_ref = spec.username
+                message = await client.get_messages(chat_ref, spec.message_id)
+                if message is None:
+                    return {"join": join_info, "resolution": resolution, "details": details, "error": "MESSAGE_NOT_FOUND"}
+                preview_text = getattr(message, "text", None) or getattr(message, "caption", None)
+                message_preview = (preview_text or "<no text>").strip()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Failed to fetch message preview")
+                return {"join": join_info, "resolution": resolution, "details": details, "error": exc.__class__.__name__}
+
+        return {
+            "join": join_info,
+            "resolution": resolution,
+            "details": details,
+            "message_preview": message_preview,
+            "chat_ref": chat_ref,
+        }
 
     try:
-        join_info, resolution, details = await _with_resolver_client(context, _runner)
+        result = await _with_resolver_client(context, _runner)
     except Exception as exc:  # noqa: BLE001
         logging.exception("Target preview failed")
         await update.effective_message.reply_text(
@@ -399,29 +478,46 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
         )
         return False
 
-    if join_info and not join_info.ok:
-        await update.effective_message.reply_text(
-            friendly_error("I could not join the invite link. Please provide a valid invite or try another session."),
-            reply_markup=navigation_keyboard(),
-        )
+    if not result:
+        await _set_status(footer=friendly_error("No result returned while resolving."))
         return False
 
-    if not resolution.ok:
+    join_info = result.get("join")
+    resolution = result.get("resolution")
+    details = result.get("details")
+
+    if join_info and not join_info.ok:
+        await _set_status(footer=friendly_error("I could not join this chat. Please provide a valid invite or try another session."))
+        return False
+
+    if not resolution or not resolution.ok:
         logging.error(
             "TargetResolver failed resolution for %s (kind=%s, error=%s)",
             spec.raw,
             spec.kind,
-            resolution.error,
+            getattr(resolution, "error", None),
             stack_info=True,
         )
-        await update.effective_message.reply_text(
-            friendly_error("Could not resolve link/chat. Ensure I have access and the link is correct."),
-            reply_markup=navigation_keyboard(),
-        )
+        await _set_status(footer=friendly_error("Could not resolve link/chat. Ensure I have access and the link is correct."))
         return False
 
-    await update.effective_message.reply_text(
-        _format_target_details(details), parse_mode=ParseMode.HTML, reply_markup=navigation_keyboard(show_back=False)
+    details = details or TargetDetails(type=None, title=None, id=None, username=None, members=None, private=False)
+    preview_lines = [_format_target_details(details)]
+    if spec.message_id:
+        preview_lines.append("")
+        preview_lines.append(f"Message ID: <code>{spec.message_id}</code>")
+        chat_ref = result.get("chat_ref") or getattr(resolution, "chat_id", None)
+        if chat_ref:
+            preview_lines.append(f"Chat reference: <code>{chat_ref}</code>")
+        message_preview = result.get("message_preview")
+        if message_preview:
+            snippet = escape(message_preview[:280])
+            preview_lines.append(f"Preview:\n<blockquote>{snippet}</blockquote>")
+
+    await status_message.edit_text(
+        "\n".join(preview_lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=navigation_keyboard(show_back=False),
     )
     return True
 

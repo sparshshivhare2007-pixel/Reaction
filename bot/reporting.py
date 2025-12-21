@@ -13,13 +13,13 @@ from telegram.ext import ContextTypes
 from bot.chat_access import resolve_chat_safe
 from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
+from bot.error_mapper import map_pyrogram_error
+from bot.health import format_duration
 from bot.state import reset_user_context
-from bot.ui import render_card, report_again_keyboard
 from bot.target_resolver import ensure_join_if_needed, fetch_target_details, parse_target, resolve_entity
+from bot.ui import render_card, report_again_keyboard
 from bot.utils import validate_sessions
 from report import report_profile_photo
-
-from bot.error_mapper import map_pyrogram_error
 
 if TYPE_CHECKING:
     # Keep type information for editors without importing Pyrogram's sync wrapper
@@ -73,6 +73,7 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     total_sessions_failed = 0
     halted = False
     last_error: str | None = None
+    overall_started = datetime.now(timezone.utc)
 
     try:
         for target in targets:
@@ -149,6 +150,10 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
 
             ended = datetime.now(timezone.utc)
             sessions_used = summary.get("sessions_started", len(sessions))
+            duration = format_duration(ended - started)
+            auto_stop_reason = None
+            if summary.get("halted") and summary.get("error"):
+                auto_stop_reason = summary.get("error")
             messages.append(
                 "\n".join(
                     [
@@ -158,7 +163,9 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
                         f"Sessions used: {sessions_used}",
                         f"Success: {summary['success']} | Failed: {summary['failed']}",
                         f"Stopped early: {'Yes' if summary.get('halted') else 'No'}",
+                        f"Duration: {duration}",
                         f"Error: {summary.get('error', 'None')}",
+                        f"Auto-stop reason: {auto_stop_reason or 'None'}",
                         f"Started: {started.isoformat()}",
                         f"Ended: {ended.isoformat()}",
                     ]
@@ -211,9 +218,11 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     else:
         body_lines = ["No report output generated."]
 
+    total_duration = format_duration(datetime.now(timezone.utc) - overall_started)
     footer = [
         f"Total success: {total_success} | failed: {total_failed}",
         f"Sessions started: {total_sessions_started} | failed/removed: {total_sessions_failed}",
+        f"Total time: {total_duration}",
     ]
     if last_error:
         footer.append(f"Last error: {last_error}")
