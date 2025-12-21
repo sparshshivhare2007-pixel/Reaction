@@ -15,8 +15,8 @@ from typing import Final
 
 BOT_TOKEN: Final[str] = "8449133505:AAFS4CP6gKpsveQefRp1LPilfkVL6FEYiuA"
 
-API_ID: Final[int] = 27989579        # ← Enter your API ID (integer)
-API_HASH: Final[str] = "64742ebe270a7d202150134d66397839"
+API_ID: Final[int] = 26658182        # ← Enter your API ID (integer)
+API_HASH: Final[str] = "d3cdbdb3b81014c71ec60ed03d2b4d8f"
 
 MONGO_URI: Final[str] = "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mongodb.net/?retryWrites=true&w=majority&appName=AnnieRE"
 
