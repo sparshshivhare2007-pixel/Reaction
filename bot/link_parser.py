@@ -8,7 +8,7 @@ from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParsedTelegramLink:
     type: Literal["invite", "public"]
     normalized_url: str
@@ -16,7 +16,7 @@ class ParsedTelegramLink:
     username: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ParsedMessageLink:
     raw: str
     normalized_url: str

@@ -36,6 +36,9 @@ class JoinResult:
     joined: bool
     reason: str | None = None
     error: str | None = None
+    chat_id: int | None = None
+    title: str | None = None
+    retry_after: int | None = None
 
 
 @dataclass
@@ -222,15 +225,21 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
         UserAlreadyParticipant,
     )
 
+    expected_chat_id = (
+        int(f"-100{target_spec.internal_id}")
+        if target_spec.kind == "internal_message" and target_spec.internal_id is not None
+        else None
+    )
+
     if not target_spec.invite_link and not target_spec.invite_hash:
-        return JoinResult(ok=True, joined=False)
+        return JoinResult(ok=True, joined=False, chat_id=expected_chat_id)
 
     invite_link = target_spec.invite_link or f"https://t.me/+{target_spec.invite_hash}"
     attempts = 0
     while attempts < 3:
         attempts += 1
         try:
-            await client.join_chat(invite_link)
+            chat = await client.join_chat(invite_link)
             logging.info(
                 "TargetResolver: joined invite",
                 extra={
@@ -240,7 +249,23 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
                     "attempt": attempts,
                 },
             )
-            return JoinResult(ok=True, joined=True)
+            chat_id = _chat_id_from_chat(chat)
+            title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
+            join_result = JoinResult(ok=True, joined=True, chat_id=chat_id, title=title)
+            if (
+                expected_chat_id is not None
+                and join_result.chat_id is not None
+                and join_result.chat_id != expected_chat_id
+            ):
+                return JoinResult(
+                    ok=False,
+                    joined=False,
+                    reason="invite_mismatch",
+                    error="invite_mismatch",
+                    chat_id=join_result.chat_id,
+                    title=join_result.title,
+                )
+            return join_result
         except UserAlreadyParticipant:
             logging.info(
                 "TargetResolver: already participant",
@@ -250,14 +275,31 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
                     "step": "ensure_join",
                 },
             )
-            return JoinResult(ok=True, joined=False, reason="already_participant")
-        except FloodWait as fw:
-            wait_seconds = min(getattr(fw, "value", 1), 60)
-            logging.warning(
-                "Flood wait %ss while joining %s (attempt %s)", wait_seconds, invite_link, attempts
+            chat = await client.get_chat(invite_link)
+            chat_id = _chat_id_from_chat(chat)
+            title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
+            return JoinResult(
+                ok=True,
+                joined=False,
+                reason="already_participant",
+                chat_id=chat_id,
+                title=title,
             )
-            await asyncio.sleep(wait_seconds)
-            continue
+        except FloodWait as fw:
+            logging.warning(
+                "Flood wait %ss while joining %s (attempt %s)",
+                getattr(fw, "value", 0),
+                invite_link,
+                attempts,
+            )
+            retry_after = int(getattr(fw, "value", 0) or 0)
+            return JoinResult(
+                ok=False,
+                joined=False,
+                reason="flood_wait",
+                error=str(fw),
+                retry_after=retry_after,
+            )
         except (InviteHashInvalid, InviteHashExpired) as exc:
             logging.error(
                 "TargetResolver: invalid invite",

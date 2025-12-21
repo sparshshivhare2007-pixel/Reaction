@@ -386,6 +386,14 @@ def _format_target_details(details) -> str:
 async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFAULT_TYPE, target_text: str) -> bool:
     """Join private chats when needed and show target details."""
 
+    from pyrogram.errors import (  # type: ignore
+        ChannelPrivate,
+        ChatIdInvalid,
+        FloodWait as PyroFloodWait,
+        MessageIdInvalid,
+        PeerIdInvalid,
+    )
+
     invite_link = flow_state(context).get("invite_link")
     try:
         spec = _attach_invite(parse_target(target_text), invite_link)
@@ -401,7 +409,29 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
         "🔍 Resolving target…", reply_markup=navigation_keyboard()
     )
 
-    async def _set_status(join: str | None = None, fetch: str | None = None, message: str | None = None, footer: str | None = None):
+    expected_chat_id = (
+        int(f"-100{spec.internal_id}")
+        if spec.kind == "internal_message" and spec.internal_id is not None
+        else None
+    )
+    debug_lines: list[str] = []
+    if spec.kind == "internal_message":
+        debug_lines.extend(
+            [
+                "Link type: private (/c/)",
+                f"internal_id: {spec.internal_id}",
+                f"expected_chat_id: {expected_chat_id}",
+                f"message_id: {spec.message_id}",
+            ]
+        )
+
+    async def _set_status(
+        join: str | None = None,
+        fetch: str | None = None,
+        message: str | None = None,
+        footer: str | None = None,
+        extra_debug: list[str] | None = None,
+    ):
         lines = ["<b>Target resolution</b>"]
         if join:
             lines.append(f"• {escape(join)}")
@@ -411,6 +441,13 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
             lines.append(f"• {escape(message)}")
         if footer:
             lines.append(footer)
+
+        debug_block = debug_lines + (extra_debug or [])
+        if debug_block:
+            lines.append("")
+            lines.append("<b>Debug</b>")
+            lines.extend(escape(item) for item in debug_block)
+
         text = "\n".join(lines)
         try:
             await status_message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=navigation_keyboard())
@@ -423,15 +460,23 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
         details = None
         message_preview = None
         await _set_status(
-            join="Joining chat…" if spec.requires_join else "Join step not required",
-            fetch="Resolving chat…",
-            message="Waiting for message…" if spec.message_id else None,
+            join="Joining chat..." if spec.requires_join else "Join step not required",
+            fetch="Resolving chat...",
+            message="Fetching message..." if spec.message_id else "Done!",
         )
         if spec.requires_join:
             join_info = await ensure_join_if_needed(client, spec)
             if not join_info.ok:
                 return {"join": join_info, "error": join_info.reason or join_info.error}
-            await _set_status(join="Joined chat", fetch="Resolving chat…")
+            if join_info.chat_id:
+                debug_lines.append(
+                    f"joined_chat_id: {join_info.chat_id} ({join_info.title or 'unknown'})"
+                )
+            await _set_status(
+                join="Joined chat",
+                fetch="Resolving chat...",
+                message="Fetching message..." if spec.message_id else "Done!",
+            )
 
         resolution = await resolve_entity(client, spec)
         if not resolution.ok:
@@ -439,23 +484,58 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
 
         details = await fetch_target_details(client, resolution)
         await _set_status(
-            join="Joined chat" if join_info else "Accessible", fetch="Chat resolved", message="Fetching message…" if spec.message_id else None
+            join="Joined chat" if join_info else "Accessible",
+            fetch="Chat resolved",
+            message="Fetching message..." if spec.message_id else "Done!",
         )
+
+        if details and details.id:
+            members = details.members if details.members is not None else "?"
+            debug_lines.append(
+                f"resolved_chat_id: {details.id} ({details.title or 'unknown'}) members: {members}"
+            )
 
         chat_ref = None
         if spec.message_id:
             try:
                 if spec.kind == "internal_message" and spec.internal_id:
-                    chat_ref = int(f"-100{spec.internal_id}")
+                    chat_ref = expected_chat_id
                 elif resolution.chat_id:
                     chat_ref = resolution.chat_id
                 elif spec.username:
                     chat_ref = spec.username
+                await _set_status(
+                    join="Joined chat" if join_info else "Accessible",
+                    fetch="Chat resolved",
+                    message="Fetching message...",
+                )
                 message = await client.get_messages(chat_ref, spec.message_id)
                 if message is None:
                     return {"join": join_info, "resolution": resolution, "details": details, "error": "MESSAGE_NOT_FOUND"}
                 preview_text = getattr(message, "text", None) or getattr(message, "caption", None)
                 message_preview = (preview_text or "<no text>").strip()
+                await _set_status(
+                    join="Joined chat" if join_info else "Accessible",
+                    fetch="Chat resolved",
+                    message="Done!",
+                )
+            except MessageIdInvalid:
+                return {"join": join_info, "resolution": resolution, "details": details, "error": "MESSAGE_ID_INVALID"}
+            except (ChannelPrivate, PeerIdInvalid, ChatIdInvalid):
+                return {
+                    "join": join_info,
+                    "resolution": resolution,
+                    "details": details,
+                    "error": "CHAT_ACCESS_DENIED",
+                }
+            except PyroFloodWait as exc:  # type: ignore[misc]
+                return {
+                    "join": join_info,
+                    "resolution": resolution,
+                    "details": details,
+                    "error": "FLOOD_WAIT",
+                    "retry_after": int(getattr(exc, "value", 0) or 0),
+                }
             except Exception as exc:  # noqa: BLE001
                 logging.exception("Failed to fetch message preview")
                 return {"join": join_info, "resolution": resolution, "details": details, "error": exc.__class__.__name__}
@@ -466,6 +546,7 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
             "details": details,
             "message_preview": message_preview,
             "chat_ref": chat_ref,
+            "expected_chat_id": expected_chat_id,
         }
 
     try:
@@ -485,6 +566,30 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
     join_info = result.get("join")
     resolution = result.get("resolution")
     details = result.get("details")
+    retry_after = result.get("retry_after")
+    expected_chat_id = result.get("expected_chat_id") or expected_chat_id
+
+    if join_info and getattr(join_info, "reason", None) == "flood_wait":
+        wait_time = join_info.retry_after or 0
+        await _set_status(
+            footer=friendly_error(
+                "Telegram rate-limited joining this chat.\nPlease try again after ~{wait_time} seconds.".format(
+                    wait_time=wait_time or "a few"
+                )
+            )
+        )
+        return False
+
+    if join_info and getattr(join_info, "reason", None) == "invite_mismatch":
+        await _set_status(
+            footer=friendly_error(
+                "Invite link does not match this private message link’s chat.\n"
+                f"Expected chat_id: {expected_chat_id}\n"
+                f"Joined chat_id: {getattr(join_info, 'chat_id', 'unknown')}\n"
+                "Please send invite link of the SAME chat."
+            )
+        )
+        return False
 
     if join_info and not join_info.ok:
         await _set_status(footer=friendly_error("I could not join this chat. Please provide a valid invite or try another session."))
@@ -501,8 +606,31 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
         await _set_status(footer=friendly_error("Could not resolve link/chat. Ensure I have access and the link is correct."))
         return False
 
+    error_code = result.get("error")
+    if error_code == "MESSAGE_ID_INVALID":
+        await _set_status(footer=friendly_error("Message deleted or inaccessible."))
+        return False
+    if error_code == "CHAT_ACCESS_DENIED":
+        await _set_status(footer=friendly_error("No access — ensure bot account joined same private chat."))
+        return False
+    if error_code == "MESSAGE_NOT_FOUND":
+        await _set_status(footer=friendly_error("Message deleted or inaccessible."))
+        return False
+    if error_code == "FLOOD_WAIT":
+        await _set_status(
+            footer=friendly_error(
+                "Telegram rate-limited fetching this message."
+                + (f" Please try again after ~{retry_after} seconds." if retry_after else "")
+            )
+        )
+        return False
+    if error_code:
+        await _set_status(footer=friendly_error("Unable to fetch message preview."))
+        return False
+
     details = details or TargetDetails(type=None, title=None, id=None, username=None, members=None, private=False)
     preview_lines = [_format_target_details(details)]
+    preview_lines.insert(0, "✅ Done!")
     if spec.message_id:
         preview_lines.append("")
         preview_lines.append(f"Message ID: <code>{spec.message_id}</code>")
