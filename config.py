@@ -13,10 +13,10 @@ from typing import Final
 #  🔴 FILL THESE VALUES CAREFULLY BEFORE DEPLOYMENT
 # -----------------------------------------------------------
 
-BOT_TOKEN: Final[str] = "8312162704:AAEEF-rxbfb9Tn1BuzwKJPdk_UL1xiV1gDU"
+BOT_TOKEN: Final[str] = "8227962612:AAHpVmUW89B2wrHo0gnPI0tvCA0ndz756iU"
 
-API_ID: Final[int] = 26658182        # ← Enter your API ID (integer)
-API_HASH: Final[str] = "d3cdbdb3b81014c71ec60ed03d2b4d8f"
+API_ID: Final[int] = 26907246        # ← Enter your API ID (integer)
+API_HASH: Final[str] = "1f75814e906cda223691847638b9fe94"
 
 MONGO_URI: Final[str] = "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mongodb.net/?retryWrites=true&w=majority&appName=AnnieRE"
 
