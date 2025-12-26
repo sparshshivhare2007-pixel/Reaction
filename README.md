@@ -23,7 +23,7 @@ This project provides a Telegram bot that coordinates multiple Pyrogram session 
 ## Deploy to Heroku
 Use the one-click button after forking the repository (update `<your-username>` in the URL to match your GitHub handle):
 
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/Oxeigns/Reaction)
+[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/sparshshivhare2007-pixel/Reaction)
 
 The `app.json` file configures the worker process and required config vars so Heroku can provision the app automatically.
 
